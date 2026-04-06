@@ -250,6 +250,25 @@ func (s *SQLiteStore) MarkNonceUsed(nonce string, ts time.Time) error {
 	return err
 }
 
+// UpdateAPNsToken 更新指定 phone_id 的 APNs 推送令牌
+func (s *SQLiteStore) UpdateAPNsToken(phoneID, token string) error {
+	result, err := s.db.Exec(
+		`UPDATE pairs SET apns_token = ? WHERE phone_id = ?`,
+		token, phoneID,
+	)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrPairNotFound
+	}
+	return nil
+}
+
 // CleanExpired 删除已过期的 token 和 nonce 记录
 func (s *SQLiteStore) CleanExpired() error {
 	now := time.Now().Unix()

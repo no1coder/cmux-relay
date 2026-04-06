@@ -101,13 +101,13 @@ func (srv *Server) Handler() http.Handler {
 		srv.pairing.HandlePairDelete(w, r)
 	})
 
-	// APNs push token 存储（存根，后续实现）
+	// APNs push token 存储
 	mux.HandleFunc("/api/push/token", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		w.WriteHeader(http.StatusAccepted)
+		srv.handlePushToken(w, r)
 	})
 
 	// WebSocket 端点
@@ -115,6 +115,33 @@ func (srv *Server) Handler() http.Handler {
 	mux.HandleFunc("/ws/phone/", srv.handlePhoneWS)
 
 	return mux
+}
+
+// pushTokenRequest 是 /api/push/token 的请求体结构
+type pushTokenRequest struct {
+	PhoneID   string `json:"phone_id"`
+	APNsToken string `json:"apns_token"`
+}
+
+// handlePushToken 解析请求体并更新配对记录中的 APNs token
+func (srv *Server) handlePushToken(w http.ResponseWriter, r *http.Request) {
+	var req pushTokenRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.PhoneID == "" || req.APNsToken == "" {
+		http.Error(w, "phone_id and apns_token are required", http.StatusBadRequest)
+		return
+	}
+
+	if err := srv.store.UpdateAPNsToken(req.PhoneID, req.APNsToken); err != nil {
+		log.Printf("[server] UpdateAPNsToken error phone=%s: %v", req.PhoneID, err)
+		http.Error(w, "failed to update apns token", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusAccepted)
 }
 
 // handleHealth 返回服务健康状态

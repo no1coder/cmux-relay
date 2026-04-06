@@ -40,12 +40,18 @@ type Relay struct {
 	store  *store.SQLiteStore
 	router *Router
 	auth   *Authenticator
+	apns   *APNsClient
 	seqGen atomic.Uint64
 }
 
-// NewRelay 创建 Relay 实例
+// NewRelay 创建 Relay 实例。apns 可以为 nil（表示未配置推送）
 func NewRelay(s *store.SQLiteStore, r *Router, a *Authenticator) *Relay {
 	return &Relay{store: s, router: r, auth: a}
+}
+
+// NewRelayWithAPNs 创建带 APNs 客户端的 Relay 实例
+func NewRelayWithAPNs(s *store.SQLiteStore, r *Router, a *Authenticator, apns *APNsClient) *Relay {
+	return &Relay{store: s, router: r, auth: a, apns: apns}
 }
 
 // HandleDeviceWS 处理 Mac 设备的 WebSocket 连接：认证 → 注册 → 消息转发
@@ -276,6 +282,7 @@ func (rl *Relay) handleResume(conn *websocket.Conn, env protocol.Envelope, devic
 }
 
 // forwardToPhone 将消息分配 seq，存入缓冲区，然后发送给在线 Phone
+// 若 Phone 不在线且事件类型需要推送，则尝试通过 APNs 发送推送通知
 func (rl *Relay) forwardToPhone(env protocol.Envelope, deviceID, phoneID string) {
 	// 分配单调递增 seq
 	seq := rl.seqGen.Add(1)
@@ -288,6 +295,8 @@ func (rl *Relay) forwardToPhone(env protocol.Envelope, deviceID, phoneID string)
 	// 发送给在线 Phone
 	pc := rl.router.GetPhone(phoneID)
 	if pc == nil {
+		// Phone 不在线，尝试 APNs 推送
+		rl.tryAPNsPush(env, phoneID)
 		return
 	}
 	data, err := json.Marshal(env)
@@ -297,6 +306,38 @@ func (rl *Relay) forwardToPhone(env protocol.Envelope, deviceID, phoneID string)
 	}
 	if err := pc.Conn.WriteMessage(websocket.TextMessage, data); err != nil {
 		log.Printf("[relay] write error to phone=%s: %v", phoneID, err)
+	}
+}
+
+// tryAPNsPush 在 Phone 不在线时，检查是否需要推送并发送 APNs 通知
+func (rl *Relay) tryAPNsPush(env protocol.Envelope, phoneID string) {
+	// 检查事件类型是否需要推送
+	if !shouldPush(string(env.Type)) {
+		return
+	}
+	// APNs 客户端未配置
+	if rl.apns == nil {
+		return
+	}
+
+	// 查询配对记录，获取 APNs token
+	pair, err := rl.store.LookupPairByPhone(phoneID)
+	if err != nil {
+		log.Printf("[relay] apns lookup pair error phone=%s: %v", phoneID, err)
+		return
+	}
+	if pair.APNsToken == "" {
+		return
+	}
+
+	// 提取摘要（payload 的前 200 字节作为摘要）
+	summary := string(env.Payload)
+	if len(summary) > 200 {
+		summary = summary[:200]
+	}
+
+	if err := rl.apns.SendPush(pair.APNsToken, string(env.Type), summary); err != nil {
+		log.Printf("[relay] apns send push error phone=%s: %v", phoneID, err)
 	}
 }
 
