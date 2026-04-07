@@ -34,7 +34,8 @@ type pairInitRequest struct {
 }
 
 type pairInitResponse struct {
-	PairToken string `json:"pair_token"`
+	PairToken  string `json:"pair_token"`
+	CheckToken string `json:"check_token"`
 }
 
 type pairConfirmRequest struct {
@@ -62,14 +63,14 @@ func (h *PairHandler) HandlePairInit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := h.store.CreatePairToken(req.DeviceID, req.DeviceName)
+	token, checkToken, err := h.store.CreatePairToken(req.DeviceID, req.DeviceName)
 	if err != nil {
 		log.Printf("[pairing] CreatePairToken error: %v", err)
 		writeError(w, http.StatusInternalServerError, "failed to create pair token")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, pairInitResponse{PairToken: token})
+	writeJSON(w, http.StatusOK, pairInitResponse{PairToken: token, CheckToken: checkToken})
 }
 
 // HandlePairConfirm 处理 POST /api/pair/confirm
@@ -85,8 +86,8 @@ func (h *PairHandler) HandlePairConfirm(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// 消费 pair token，获取对应的 device_id 和 device_name
-	deviceID, deviceName, err := h.store.ConsumePairToken(req.PairToken)
+	// 消费 pair token，获取对应的 device_id、device_name 和 check_token
+	deviceID, deviceName, checkToken, err := h.store.ConsumePairToken(req.PairToken)
 	if err != nil {
 		if errors.Is(err, store.ErrTokenInvalid) {
 			writeError(w, http.StatusUnauthorized, "pair token invalid or expired")
@@ -126,6 +127,13 @@ func (h *PairHandler) HandlePairConfirm(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// 暂存 pair_secret 供 Mac 轮询取回（Mac 在配对期间可能没有 WebSocket 连接）
+	// check_token 用于验证轮询方身份
+	if err := h.store.SavePendingSecret(deviceID, pairSecret, checkToken); err != nil {
+		log.Printf("[pairing] SavePendingSecret error: %v", err)
+		// 非致命错误，继续处理
+	}
+
 	// 如果 Mac 在线，通过 WebSocket 通知配对完成
 	if dc := h.router.GetDevice(deviceID); dc != nil {
 		notify := map[string]string{
@@ -146,8 +154,44 @@ func (h *PairHandler) HandlePairConfirm(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+// HandlePairCheck 处理 GET /api/pair/check/{device_id}?check_token=xxx
+// Mac 在显示 QR 码后轮询此接口，获取 iOS 确认后暂存的 pair_secret
+// 需要提供 check_token（init 时返回的）作为认证凭证，防止未授权访问
+func (h *PairHandler) HandlePairCheck(w http.ResponseWriter, r *http.Request) {
+	deviceID := strings.TrimPrefix(r.URL.Path, "/api/pair/check/")
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		writeError(w, http.StatusBadRequest, "device_id is required")
+		return
+	}
+
+	// 验证 check_token 参数，防止未授权方轮询获取 pair_secret
+	checkToken := r.URL.Query().Get("check_token")
+	if checkToken == "" {
+		writeError(w, http.StatusUnauthorized, "check_token is required")
+		return
+	}
+
+	pairSecret, phoneName, phoneID, err := h.store.ConsumePendingSecret(deviceID, checkToken)
+	if err != nil {
+		// 未找到、已过期或 check_token 不匹配：尚未配对
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "not_paired"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status":      "paired",
+		"phone_id":    phoneID,
+		"phone_name":  phoneName,
+		"pair_secret": pairSecret,
+	})
+}
+
 // HandlePairDelete 处理 DELETE /api/pair/{phone_id}
 // 解除配对，关闭 Phone 连接，通知 Mac
+// TODO(security): 添加 HMAC 签名认证（X-Signature + X-Timestamp），防止未授权删除配对
 func (h *PairHandler) HandlePairDelete(w http.ResponseWriter, r *http.Request) {
 	// 从 URL path 末尾提取 phone_id
 	phoneID := strings.TrimPrefix(r.URL.Path, "/api/pair/")

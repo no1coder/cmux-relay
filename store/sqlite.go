@@ -89,12 +89,20 @@ func (s *SQLiteStore) migrate() error {
 			token       TEXT PRIMARY KEY,
 			device_id   TEXT NOT NULL,
 			device_name TEXT NOT NULL DEFAULT '',
+			check_token TEXT NOT NULL DEFAULT '',
 			expires_at  INTEGER NOT NULL
 		);
 
 		CREATE TABLE IF NOT EXISTS used_nonces (
 			nonce      TEXT PRIMARY KEY,
 			expires_at INTEGER NOT NULL
+		);
+
+		CREATE TABLE IF NOT EXISTS pending_pair_secrets (
+			device_id   TEXT PRIMARY KEY,
+			pair_secret TEXT NOT NULL,
+			check_token TEXT NOT NULL DEFAULT '',
+			expires_at  INTEGER NOT NULL
 		);
 	`)
 	return err
@@ -169,58 +177,67 @@ func (s *SQLiteStore) DeletePair(deviceID string) error {
 }
 
 // CreatePairToken 为指定设备生成一个随机 32 字节 hex token，有效期 5 分钟
+// 同时生成 check_token，供 Mac 轮询 pair/check 时作为认证凭证
 // deviceName 用于在配对确认时返回给 iOS 端展示，避免后续再查询
-func (s *SQLiteStore) CreatePairToken(deviceID, deviceName string) (string, error) {
+func (s *SQLiteStore) CreatePairToken(deviceID, deviceName string) (token string, checkToken string, err error) {
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
-		return "", err
+		return "", "", err
 	}
-	token := hex.EncodeToString(raw)
+	token = hex.EncodeToString(raw)
+
+	// 生成 check_token，Mac 用于轮询 pair/check 时的认证凭证
+	rawCheck := make([]byte, 32)
+	if _, err := rand.Read(rawCheck); err != nil {
+		return "", "", err
+	}
+	checkToken = hex.EncodeToString(rawCheck)
+
 	expiresAt := time.Now().Add(5 * time.Minute).Unix()
 
-	_, err := s.db.Exec(`
-		INSERT INTO pair_tokens (token, device_id, device_name, expires_at) VALUES (?, ?, ?, ?)`,
-		token, deviceID, deviceName, expiresAt,
+	_, execErr := s.db.Exec(`
+		INSERT INTO pair_tokens (token, device_id, device_name, check_token, expires_at) VALUES (?, ?, ?, ?, ?)`,
+		token, deviceID, deviceName, checkToken, expiresAt,
 	)
-	if err != nil {
-		return "", err
+	if execErr != nil {
+		return "", "", execErr
 	}
-	return token, nil
+	return token, checkToken, nil
 }
 
-// ConsumePairToken 以事务方式消费 token：验证有效性、删除记录、返回 deviceID 和 deviceName
-func (s *SQLiteStore) ConsumePairToken(token string) (deviceID, deviceName string, err error) {
+// ConsumePairToken 以事务方式消费 token：验证有效性、删除记录、返回 deviceID、deviceName 和 checkToken
+func (s *SQLiteStore) ConsumePairToken(token string) (deviceID, deviceName, checkToken string, err error) {
 	tx, txErr := s.db.Begin()
 	if txErr != nil {
-		return "", "", txErr
+		return "", "", "", txErr
 	}
 	defer tx.Rollback() //nolint:errcheck
 
 	var expiresAt int64
 	scanErr := tx.QueryRow(`
-		SELECT device_id, device_name, expires_at FROM pair_tokens WHERE token = ?`, token).
-		Scan(&deviceID, &deviceName, &expiresAt)
+		SELECT device_id, device_name, check_token, expires_at FROM pair_tokens WHERE token = ?`, token).
+		Scan(&deviceID, &deviceName, &checkToken, &expiresAt)
 	if errors.Is(scanErr, sql.ErrNoRows) {
-		return "", "", ErrTokenInvalid
+		return "", "", "", ErrTokenInvalid
 	}
 	if scanErr != nil {
-		return "", "", scanErr
+		return "", "", "", scanErr
 	}
 
 	// 检查是否已过期
 	if time.Now().Unix() > expiresAt {
-		return "", "", ErrTokenInvalid
+		return "", "", "", ErrTokenInvalid
 	}
 
 	// 删除 token（一次性使用）
 	if _, delErr := tx.Exec(`DELETE FROM pair_tokens WHERE token = ?`, token); delErr != nil {
-		return "", "", delErr
+		return "", "", "", delErr
 	}
 
 	if commitErr := tx.Commit(); commitErr != nil {
-		return "", "", commitErr
+		return "", "", "", commitErr
 	}
-	return deviceID, deviceName, nil
+	return deviceID, deviceName, checkToken, nil
 }
 
 // TryMarkNonce 原子化地尝试标记 nonce 为已使用。
@@ -239,34 +256,6 @@ func (s *SQLiteStore) TryMarkNonce(nonce string, expiresAt int64) (firstUse bool
 		return false, err
 	}
 	return rows > 0, nil
-}
-
-// IsNonceUsed 检查 nonce 是否已被使用
-func (s *SQLiteStore) IsNonceUsed(nonce string) (bool, error) {
-	var expiresAt int64
-	err := s.db.QueryRow(`
-		SELECT expires_at FROM used_nonces WHERE nonce = ?`, nonce).Scan(&expiresAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	// 如果记录存在但已过期，视为未使用
-	if time.Now().Unix() > expiresAt {
-		return false, nil
-	}
-	return true, nil
-}
-
-// MarkNonceUsed 标记 nonce 已使用，TTL 为 60 秒
-func (s *SQLiteStore) MarkNonceUsed(nonce string, ts time.Time) error {
-	expiresAt := ts.Add(60 * time.Second).Unix()
-	_, err := s.db.Exec(`
-		INSERT OR REPLACE INTO used_nonces (nonce, expires_at) VALUES (?, ?)`,
-		nonce, expiresAt,
-	)
-	return err
 }
 
 // UpdateAPNsToken 更新指定 phone_id 的 APNs 推送令牌
@@ -288,13 +277,81 @@ func (s *SQLiteStore) UpdateAPNsToken(phoneID, token string) error {
 	return nil
 }
 
-// CleanExpired 删除已过期的 token 和 nonce 记录
+// SavePendingSecret 暂存配对密钥，供 Mac 轮询取回（有效期 5 分钟）
+// checkToken 用于验证轮询方的身份，防止未授权访问
+func (s *SQLiteStore) SavePendingSecret(deviceID, pairSecret, checkToken string) error {
+	expiresAt := time.Now().Add(5 * time.Minute).Unix()
+	_, err := s.db.Exec(`
+		INSERT OR REPLACE INTO pending_pair_secrets (device_id, pair_secret, check_token, expires_at)
+		VALUES (?, ?, ?, ?)`,
+		deviceID, pairSecret, checkToken, expiresAt,
+	)
+	return err
+}
+
+// ConsumePendingSecret 一次性取回暂存的配对密钥（取后即删）。
+// 需要提供 checkToken 验证调用方身份，防止未授权访问。
+// 未找到、已过期或 checkToken 不匹配时返回 ErrPairNotFound。
+func (s *SQLiteStore) ConsumePendingSecret(deviceID, checkToken string) (pairSecret string, phoneName string, phoneID string, err error) {
+	tx, txErr := s.db.Begin()
+	if txErr != nil {
+		return "", "", "", txErr
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	var expiresAt int64
+	var storedCheckToken string
+	scanErr := tx.QueryRow(`
+		SELECT pair_secret, check_token, expires_at FROM pending_pair_secrets WHERE device_id = ?`, deviceID).
+		Scan(&pairSecret, &storedCheckToken, &expiresAt)
+	if errors.Is(scanErr, sql.ErrNoRows) {
+		return "", "", "", ErrPairNotFound
+	}
+	if scanErr != nil {
+		return "", "", "", scanErr
+	}
+
+	if time.Now().Unix() > expiresAt {
+		// 过期，删除并返回未找到
+		tx.Exec(`DELETE FROM pending_pair_secrets WHERE device_id = ?`, deviceID)
+		tx.Commit()
+		return "", "", "", ErrPairNotFound
+	}
+
+	// 验证 check_token，防止未授权方轮询获取 pair_secret
+	if storedCheckToken != checkToken {
+		return "", "", "", ErrPairNotFound
+	}
+
+	// 删除记录（一次性消费）
+	if _, delErr := tx.Exec(`DELETE FROM pending_pair_secrets WHERE device_id = ?`, deviceID); delErr != nil {
+		return "", "", "", delErr
+	}
+
+	// 从 pairs 表获取 phone_id 和 phone_name
+	scanErr = tx.QueryRow(`
+		SELECT phone_id, phone_name FROM pairs WHERE device_id = ?`, deviceID).
+		Scan(&phoneID, &phoneName)
+	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
+		return "", "", "", scanErr
+	}
+
+	if commitErr := tx.Commit(); commitErr != nil {
+		return "", "", "", commitErr
+	}
+	return pairSecret, phoneName, phoneID, nil
+}
+
+// CleanExpired 删除已过期的 token、nonce 和暂存密钥记录
 func (s *SQLiteStore) CleanExpired() error {
 	now := time.Now().Unix()
 	if _, err := s.db.Exec(`DELETE FROM pair_tokens WHERE expires_at < ?`, now); err != nil {
 		return err
 	}
 	if _, err := s.db.Exec(`DELETE FROM used_nonces WHERE expires_at < ?`, now); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`DELETE FROM pending_pair_secrets WHERE expires_at < ?`, now); err != nil {
 		return err
 	}
 	return nil

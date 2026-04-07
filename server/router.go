@@ -3,9 +3,13 @@ package server
 
 import (
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
+
+// writeTimeout 是单次 WebSocket 写操作的超时时间，防止慢客户端阻塞写协程
+const writeTimeout = 10 * time.Second
 
 // DeviceConn 表示已连接的设备（Mac 或 iPhone）
 type DeviceConn struct {
@@ -22,10 +26,16 @@ type DeviceConn struct {
 }
 
 // SafeWrite 以互斥方式向 WebSocket 连接写入消息，防止并发写冲突
+// 设置写超时防止慢客户端长期占用写锁
 func (dc *DeviceConn) SafeWrite(msgType int, data []byte) error {
 	dc.writeMu.Lock()
 	defer dc.writeMu.Unlock()
-	return dc.Conn.WriteMessage(msgType, data)
+	if err := dc.Conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+		return err
+	}
+	err := dc.Conn.WriteMessage(msgType, data)
+	_ = dc.Conn.SetWriteDeadline(time.Time{}) // 清除写超时
+	return err
 }
 
 // Router 管理已连接设备的路由表，并维护每对设备的消息缓冲区。

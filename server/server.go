@@ -110,6 +110,13 @@ func (srv *Server) Handler() http.Handler {
 		}
 		srv.pairing.HandlePairConfirm(w, r)
 	})
+	mux.HandleFunc("/api/pair/check/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		srv.pairing.HandlePairCheck(w, r)
+	})
 	mux.HandleFunc("/api/pair/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodDelete {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -141,6 +148,7 @@ type pushTokenRequest struct {
 }
 
 // handlePushToken 解析请求体并更新配对记录中的 APNs token
+// TODO(security): 添加 HMAC 签名认证（X-Signature + X-Timestamp），防止未授权更新 APNs token
 func (srv *Server) handlePushToken(w http.ResponseWriter, r *http.Request) {
 	var req pushTokenRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

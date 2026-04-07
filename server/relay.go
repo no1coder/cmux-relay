@@ -207,15 +207,19 @@ func (rl *Relay) doAuthHandshake(conn *websocket.Conn, clientID string) (string,
 		_ = conn.SetReadDeadline(time.Time{})
 	}()
 
-	// 1. 生成并发送 challenge
+	// 1. 生成并发送 challenge（设置写超时防止慢客户端阻塞）
 	nonce, err := GenerateNonce()
 	if err != nil {
 		return "", err
 	}
 	challenge := authChallengeMsg{Type: "auth_challenge", Nonce: nonce}
+	if err := conn.SetWriteDeadline(time.Now().Add(authTimeout)); err != nil {
+		return "", err
+	}
 	if err := conn.WriteJSON(challenge); err != nil {
 		return "", err
 	}
+	_ = conn.SetWriteDeadline(time.Time{}) // 清除写超时
 
 	// 2. 接收客户端 auth 消息
 	_, data, err := conn.ReadMessage()
@@ -246,8 +250,8 @@ func (rl *Relay) doAuthHandshake(conn *websocket.Conn, clientID string) (string,
 	}
 
 	// 5. 原子化标记 nonce 已使用（同时完成查重和标记，防重放攻击竞态）
-	// expiresAt = 请求时间戳 + 60 秒
-	nonceExpiresAt := clientMsg.Timestamp + 60
+	// 使用服务端时间计算过期时间，防止客户端伪造时间戳延长 nonce 有效期
+	nonceExpiresAt := time.Now().Unix() + 60
 	firstUse, err := rl.store.TryMarkNonce(clientMsg.Nonce, nonceExpiresAt)
 	if err != nil {
 		_ = conn.WriteMessage(websocket.TextMessage, marshalSimple("type", "auth_failed"))
@@ -258,10 +262,14 @@ func (rl *Relay) doAuthHandshake(conn *websocket.Conn, clientID string) (string,
 		return "", errors.New("nonce already used")
 	}
 
-	// 6. 发送 auth_ok
+	// 6. 发送 auth_ok（设置写超时防止慢客户端阻塞）
+	if err := conn.SetWriteDeadline(time.Now().Add(authTimeout)); err != nil {
+		return "", err
+	}
 	if err := conn.WriteMessage(websocket.TextMessage, marshalSimple("type", "auth_ok")); err != nil {
 		return "", err
 	}
+	_ = conn.SetWriteDeadline(time.Time{}) // 清除写超时
 
 	return secretHash, nil
 }

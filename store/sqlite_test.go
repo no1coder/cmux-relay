@@ -92,17 +92,20 @@ func TestDeletePair(t *testing.T) {
 func TestPairTokenLifecycle(t *testing.T) {
 	s := newTestStore(t)
 
-	// 创建 token（带 device_name）
-	token, err := s.CreatePairToken("device-003", "MacBook Pro Test")
+	// 创建 token（带 device_name），同时返回 check_token
+	token, checkToken, err := s.CreatePairToken("device-003", "MacBook Pro Test")
 	if err != nil {
 		t.Fatalf("CreatePairToken 失败: %v", err)
 	}
 	if len(token) == 0 {
 		t.Fatal("token 不应为空")
 	}
+	if len(checkToken) == 0 {
+		t.Fatal("check_token 不应为空")
+	}
 
-	// 第一次消费 token 应成功，且返回 deviceName
-	deviceID, deviceName, err := s.ConsumePairToken(token)
+	// 第一次消费 token 应成功，且返回 deviceName 和 checkToken
+	deviceID, deviceName, gotCheckToken, err := s.ConsumePairToken(token)
 	if err != nil {
 		t.Fatalf("ConsumePairToken 第一次调用失败: %v", err)
 	}
@@ -112,41 +115,14 @@ func TestPairTokenLifecycle(t *testing.T) {
 	if deviceName != "MacBook Pro Test" {
 		t.Errorf("期望 deviceName=MacBook Pro Test, 得到 %s", deviceName)
 	}
+	if gotCheckToken != checkToken {
+		t.Errorf("期望 checkToken=%s, 得到 %s", checkToken, gotCheckToken)
+	}
 
 	// 第二次消费同一 token 应失败
-	_, _, err = s.ConsumePairToken(token)
+	_, _, _, err = s.ConsumePairToken(token)
 	if err != store.ErrTokenInvalid {
 		t.Errorf("期望 ErrTokenInvalid, 得到 %v", err)
-	}
-}
-
-// TestNonceDedup 测试 nonce 去重：首次检查未使用，标记使用，再次检查已使用
-func TestNonceDedup(t *testing.T) {
-	s := newTestStore(t)
-
-	nonce := "test-nonce-12345"
-
-	// 首次检查：未使用
-	used, err := s.IsNonceUsed(nonce)
-	if err != nil {
-		t.Fatalf("IsNonceUsed 失败: %v", err)
-	}
-	if used {
-		t.Error("nonce 应尚未使用")
-	}
-
-	// 标记为已使用
-	if err := s.MarkNonceUsed(nonce, time.Now()); err != nil {
-		t.Fatalf("MarkNonceUsed 失败: %v", err)
-	}
-
-	// 再次检查：已使用
-	used, err = s.IsNonceUsed(nonce)
-	if err != nil {
-		t.Fatalf("IsNonceUsed 第二次调用失败: %v", err)
-	}
-	if !used {
-		t.Error("nonce 应已标记为使用")
 	}
 }
 
