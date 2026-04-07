@@ -1,0 +1,23 @@
+# 编译产物
+cmux-relay
+*.exe
+*.db
+*.db-wal
+*.db-shm
+
+# TLS 证书（绝对不能提交）
+*.pem
+*.key
+*.crt
+*.p8
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# macOS
+.DS_Store
+
+# Docker
+docker-compose.override.yml

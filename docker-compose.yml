@@ -1,0 +1,22 @@
+services:
+  relay:
+    build: .
+    container_name: cmux-relay
+    restart: unless-stopped
+    ports:
+      - "8443:8443"
+    volumes:
+      # 持久化数据库
+      - relay-data:/app/data
+      # TLS 证书（可选，由反向代理处理时不需要）
+      # - ./certs:/app/certs:ro
+    # 如果需要 cmux-relay 自己处理 TLS：
+    # command: ["-addr", ":8443", "-db", "/app/data/cmux-relay.db", "-cert", "/app/certs/cert.pem", "-key", "/app/certs/key.pem"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8443/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  relay-data:
