@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -25,6 +26,8 @@ type Server struct {
 	router  *Router
 	relay   *Relay
 	pairing *PairHandler
+	// cancel 用于停止后台 goroutine
+	cancel context.CancelFunc
 }
 
 // NewServer 创建并初始化 Server，dbPath 为 SQLite 数据库文件路径
@@ -47,26 +50,40 @@ func NewServer(dbPath string) (*Server, error) {
 	// 配对 API 处理器
 	pairing := NewPairHandler(s, r)
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	srv := &Server{
 		store:   s,
 		router:  r,
 		relay:   relay,
 		pairing: pairing,
+		cancel:  cancel,
 	}
 
 	// 启动后台任务：每分钟清理过期 token 和 nonce
-	go srv.startCleanup()
+	go srv.startCleanup(ctx)
 
 	return srv, nil
 }
 
-// startCleanup 每分钟清理过期的 pair token 和 nonce
-func (srv *Server) startCleanup() {
+// Close 停止后台 goroutine 并关闭数据库连接
+func (srv *Server) Close() error {
+	srv.cancel()
+	return srv.store.Close()
+}
+
+// startCleanup 每分钟清理过期的 pair token 和 nonce，直到 ctx 取消
+func (srv *Server) startCleanup(ctx context.Context) {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
-	for range ticker.C {
-		if err := srv.store.CleanExpired(); err != nil {
-			log.Printf("[server] CleanExpired error: %v", err)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := srv.store.CleanExpired(); err != nil {
+				log.Printf("[server] CleanExpired error: %v", err)
+			}
 		}
 	}
 }

@@ -18,10 +18,10 @@ func sha256Hash(s string) string {
 }
 
 // computeHMAC 使用 HMAC-SHA256 计算签名
-// key 为 secretHash（即 SHA256(pair_secret)），消息为 deviceID+nonce+timestamp
+// key 为 secretHash（即 SHA256(pair_secret)），消息为 deviceID:nonce:timestamp（冒号分隔）
 func computeHMAC(secretHash, deviceID, nonce string, ts int64) string {
 	mac := hmac.New(sha256.New, []byte(secretHash))
-	mac.Write([]byte(fmt.Sprintf("%s%s%d", deviceID, nonce, ts)))
+	mac.Write([]byte(fmt.Sprintf("%s:%s:%d", deviceID, nonce, ts)))
 	return hex.EncodeToString(mac.Sum(nil))
 }
 

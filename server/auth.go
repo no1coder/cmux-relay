@@ -77,10 +77,10 @@ func sha256Hash(s string) string {
 }
 
 // computeHMACHex 使用 secretHash 作为 key 计算 HMAC-SHA256
-// 消息格式为 deviceID + nonce + timestamp
+// 消息格式为 deviceID:nonce:timestamp（用冒号分隔，防止字段拼接歧义）
 func computeHMACHex(secretHash, deviceID, nonce string, ts int64) string {
 	mac := hmac.New(sha256.New, []byte(secretHash))
-	mac.Write([]byte(fmt.Sprintf("%s%s%d", deviceID, nonce, ts)))
+	mac.Write([]byte(fmt.Sprintf("%s:%s:%d", deviceID, nonce, ts)))
 	return hex.EncodeToString(mac.Sum(nil))
 }
 

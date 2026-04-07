@@ -62,7 +62,7 @@ func (h *PairHandler) HandlePairInit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := h.store.CreatePairToken(req.DeviceID)
+	token, err := h.store.CreatePairToken(req.DeviceID, req.DeviceName)
 	if err != nil {
 		log.Printf("[pairing] CreatePairToken error: %v", err)
 		writeError(w, http.StatusInternalServerError, "failed to create pair token")
@@ -85,8 +85,8 @@ func (h *PairHandler) HandlePairConfirm(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// 消费 pair token，获取对应的 device_id
-	deviceID, err := h.store.ConsumePairToken(req.PairToken)
+	// 消费 pair token，获取对应的 device_id 和 device_name
+	deviceID, deviceName, err := h.store.ConsumePairToken(req.PairToken)
 	if err != nil {
 		if errors.Is(err, store.ErrTokenInvalid) {
 			writeError(w, http.StatusUnauthorized, "pair token invalid or expired")
@@ -95,13 +95,6 @@ func (h *PairHandler) HandlePairConfirm(w http.ResponseWriter, r *http.Request) 
 		log.Printf("[pairing] ConsumePairToken error: %v", err)
 		writeError(w, http.StatusInternalServerError, "failed to consume pair token")
 		return
-	}
-
-	// 查询 Mac 设备信息（仅取 device_name，device_id 已知）
-	existingPair, err := h.store.LookupPairByDevice(deviceID)
-	deviceName := ""
-	if err == nil {
-		deviceName = existingPair.DeviceName
 	}
 
 	// 生成 32 字节随机 pair_secret
@@ -117,14 +110,7 @@ func (h *PairHandler) HandlePairConfirm(w http.ResponseWriter, r *http.Request) 
 	hash := sha256.Sum256([]byte(pairSecret))
 	secretHash := hex.EncodeToString(hash[:])
 
-	// 如果 device_name 还未知（首次配对），需要客户端在 init 时传入
-	// 此处用空字符串兜底，实际 device_name 在 init 阶段已存入 token 附属信息
-	// 由于 store.CreatePairToken 不存 device_name，我们尝试从现有配对记录获取
-	if deviceName == "" {
-		// 尝试查询已有配对（可能是重新配对的场景）
-		deviceName = deviceID // 降级处理：用 device_id 作为 device_name
-	}
-
+	// device_name 已从 pair_token 记录中获取，无需再查询或降级处理
 	pair := store.Pair{
 		DeviceID:   deviceID,
 		DeviceName: deviceName,
@@ -148,8 +134,8 @@ func (h *PairHandler) HandlePairConfirm(w http.ResponseWriter, r *http.Request) 
 			"phone_name": req.PhoneName,
 		}
 		if data, err := json.Marshal(notify); err == nil {
-			// 使用 WriteMessage 发送，忽略错误（Mac 可能已断开）
-			_ = dc.Conn.WriteMessage(websocket.TextMessage, data)
+			// 使用 SafeWrite 发送，忽略错误（Mac 可能已断开）
+			_ = dc.SafeWrite(websocket.TextMessage, data)
 		}
 	}
 
@@ -201,7 +187,7 @@ func (h *PairHandler) HandlePairDelete(w http.ResponseWriter, r *http.Request) {
 			"phone_id": phoneID,
 		}
 		if data, err := json.Marshal(notify); err == nil {
-			_ = dc.Conn.WriteMessage(websocket.TextMessage, data)
+			_ = dc.SafeWrite(websocket.TextMessage, data)
 		}
 	}
 

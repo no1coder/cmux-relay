@@ -50,10 +50,14 @@ func NewAPNsClient(teamID, keyID, bundleID string) *APNsClient {
 }
 
 // SendPush 向设备推送通知。
-// 如果 bundleID 未配置，则静默返回 nil（功能关闭）。
+// 如果 bundleID、teamID 或 keyID 未配置，则静默返回 nil（功能关闭）。
 func (c *APNsClient) SendPush(deviceToken, eventType, summary string) error {
 	// 未配置时静默跳过
 	if c == nil || c.bundleID == "" {
+		return nil
+	}
+	// teamID 或 keyID 缺失时无法生成有效 JWT，提前返回避免发送无效请求
+	if c.teamID == "" || c.keyID == "" {
 		return nil
 	}
 

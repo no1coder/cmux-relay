@@ -11,12 +11,21 @@ import (
 type DeviceConn struct {
 	// Conn 是底层的 WebSocket 连接
 	Conn *websocket.Conn
+	// writeMu 保护并发写，防止多协程同时调用 WriteMessage 导致数据竞争
+	writeMu sync.Mutex
 	// DeviceID 是 Mac 设备的唯一标识
 	DeviceID string
 	// PairID 是配对对端的 ID（Mac 侧存 PhoneID，Phone 侧存 DeviceID）
 	PairID string
 	// IsMac 为 true 表示是 Mac 设备，false 表示是 iPhone
 	IsMac bool
+}
+
+// SafeWrite 以互斥方式向 WebSocket 连接写入消息，防止并发写冲突
+func (dc *DeviceConn) SafeWrite(msgType int, data []byte) error {
+	dc.writeMu.Lock()
+	defer dc.writeMu.Unlock()
+	return dc.Conn.WriteMessage(msgType, data)
 }
 
 // Router 管理已连接设备的路由表，并维护每对设备的消息缓冲区。

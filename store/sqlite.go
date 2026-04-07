@@ -86,9 +86,10 @@ func (s *SQLiteStore) migrate() error {
 		);
 
 		CREATE TABLE IF NOT EXISTS pair_tokens (
-			token      TEXT PRIMARY KEY,
-			device_id  TEXT NOT NULL,
-			expires_at INTEGER NOT NULL
+			token       TEXT PRIMARY KEY,
+			device_id   TEXT NOT NULL,
+			device_name TEXT NOT NULL DEFAULT '',
+			expires_at  INTEGER NOT NULL
 		);
 
 		CREATE TABLE IF NOT EXISTS used_nonces (
@@ -168,7 +169,8 @@ func (s *SQLiteStore) DeletePair(deviceID string) error {
 }
 
 // CreatePairToken 为指定设备生成一个随机 32 字节 hex token，有效期 5 分钟
-func (s *SQLiteStore) CreatePairToken(deviceID string) (string, error) {
+// deviceName 用于在配对确认时返回给 iOS 端展示，避免后续再查询
+func (s *SQLiteStore) CreatePairToken(deviceID, deviceName string) (string, error) {
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
 		return "", err
@@ -177,8 +179,8 @@ func (s *SQLiteStore) CreatePairToken(deviceID string) (string, error) {
 	expiresAt := time.Now().Add(5 * time.Minute).Unix()
 
 	_, err := s.db.Exec(`
-		INSERT INTO pair_tokens (token, device_id, expires_at) VALUES (?, ?, ?)`,
-		token, deviceID, expiresAt,
+		INSERT INTO pair_tokens (token, device_id, device_name, expires_at) VALUES (?, ?, ?, ?)`,
+		token, deviceID, deviceName, expiresAt,
 	)
 	if err != nil {
 		return "", err
@@ -186,40 +188,57 @@ func (s *SQLiteStore) CreatePairToken(deviceID string) (string, error) {
 	return token, nil
 }
 
-// ConsumePairToken 以事务方式消费 token：验证有效性、删除记录、返回 deviceID
-func (s *SQLiteStore) ConsumePairToken(token string) (string, error) {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return "", err
+// ConsumePairToken 以事务方式消费 token：验证有效性、删除记录、返回 deviceID 和 deviceName
+func (s *SQLiteStore) ConsumePairToken(token string) (deviceID, deviceName string, err error) {
+	tx, txErr := s.db.Begin()
+	if txErr != nil {
+		return "", "", txErr
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	var deviceID string
 	var expiresAt int64
-	err = tx.QueryRow(`
-		SELECT device_id, expires_at FROM pair_tokens WHERE token = ?`, token).
-		Scan(&deviceID, &expiresAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", ErrTokenInvalid
+	scanErr := tx.QueryRow(`
+		SELECT device_id, device_name, expires_at FROM pair_tokens WHERE token = ?`, token).
+		Scan(&deviceID, &deviceName, &expiresAt)
+	if errors.Is(scanErr, sql.ErrNoRows) {
+		return "", "", ErrTokenInvalid
 	}
-	if err != nil {
-		return "", err
+	if scanErr != nil {
+		return "", "", scanErr
 	}
 
 	// 检查是否已过期
 	if time.Now().Unix() > expiresAt {
-		return "", ErrTokenInvalid
+		return "", "", ErrTokenInvalid
 	}
 
 	// 删除 token（一次性使用）
-	if _, err := tx.Exec(`DELETE FROM pair_tokens WHERE token = ?`, token); err != nil {
-		return "", err
+	if _, delErr := tx.Exec(`DELETE FROM pair_tokens WHERE token = ?`, token); delErr != nil {
+		return "", "", delErr
 	}
 
-	if err := tx.Commit(); err != nil {
-		return "", err
+	if commitErr := tx.Commit(); commitErr != nil {
+		return "", "", commitErr
 	}
-	return deviceID, nil
+	return deviceID, deviceName, nil
+}
+
+// TryMarkNonce 原子化地尝试标记 nonce 为已使用。
+// 返回 firstUse=true 表示本次调用成功占用（首次使用），firstUse=false 表示 nonce 已存在（重放攻击）。
+// 底层使用 INSERT OR IGNORE，通过 RowsAffected 判断是否真正插入，彻底消除 check-then-act 竞态。
+func (s *SQLiteStore) TryMarkNonce(nonce string, expiresAt int64) (firstUse bool, err error) {
+	result, err := s.db.Exec(`
+		INSERT OR IGNORE INTO used_nonces (nonce, expires_at) VALUES (?, ?)`,
+		nonce, expiresAt,
+	)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
 }
 
 // IsNonceUsed 检查 nonce 是否已被使用

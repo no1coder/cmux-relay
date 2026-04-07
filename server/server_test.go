@@ -26,11 +26,11 @@ func testSHA256Hex(s string) string {
 }
 
 // testComputeHMAC 计算 HMAC-SHA256 签名，与 auth.go 中的 computeHMACHex 等价
-// key = SHA256(pair_secret)（hex 字符串），message = deviceID + nonce + timestamp
+// key = SHA256(pair_secret)（hex 字符串），message = deviceID:nonce:timestamp（冒号分隔）
 func testComputeHMAC(secret, deviceID, nonce string, ts int64) string {
 	secretHash := testSHA256Hex(secret)
 	mac := hmac.New(sha256.New, []byte(secretHash))
-	mac.Write([]byte(fmt.Sprintf("%s%s%d", deviceID, nonce, ts)))
+	mac.Write([]byte(fmt.Sprintf("%s:%s:%d", deviceID, nonce, ts)))
 	return hex.EncodeToString(mac.Sum(nil))
 }
 

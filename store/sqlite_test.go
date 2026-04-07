@@ -92,8 +92,8 @@ func TestDeletePair(t *testing.T) {
 func TestPairTokenLifecycle(t *testing.T) {
 	s := newTestStore(t)
 
-	// 创建 token
-	token, err := s.CreatePairToken("device-003")
+	// 创建 token（带 device_name）
+	token, err := s.CreatePairToken("device-003", "MacBook Pro Test")
 	if err != nil {
 		t.Fatalf("CreatePairToken 失败: %v", err)
 	}
@@ -101,17 +101,20 @@ func TestPairTokenLifecycle(t *testing.T) {
 		t.Fatal("token 不应为空")
 	}
 
-	// 第一次消费 token 应成功
-	deviceID, err := s.ConsumePairToken(token)
+	// 第一次消费 token 应成功，且返回 deviceName
+	deviceID, deviceName, err := s.ConsumePairToken(token)
 	if err != nil {
 		t.Fatalf("ConsumePairToken 第一次调用失败: %v", err)
 	}
 	if deviceID != "device-003" {
 		t.Errorf("期望 deviceID=device-003, 得到 %s", deviceID)
 	}
+	if deviceName != "MacBook Pro Test" {
+		t.Errorf("期望 deviceName=MacBook Pro Test, 得到 %s", deviceName)
+	}
 
 	// 第二次消费同一 token 应失败
-	_, err = s.ConsumePairToken(token)
+	_, _, err = s.ConsumePairToken(token)
 	if err != store.ErrTokenInvalid {
 		t.Errorf("期望 ErrTokenInvalid, 得到 %v", err)
 	}
@@ -144,5 +147,31 @@ func TestNonceDedup(t *testing.T) {
 	}
 	if !used {
 		t.Error("nonce 应已标记为使用")
+	}
+}
+
+// TestTryMarkNonce 测试原子化 nonce 标记：首次返回 true，重复调用返回 false
+func TestTryMarkNonce(t *testing.T) {
+	s := newTestStore(t)
+
+	nonce := "atomic-nonce-xyz"
+	expiresAt := time.Now().Add(60 * time.Second).Unix()
+
+	// 首次调用应返回 firstUse=true
+	firstUse, err := s.TryMarkNonce(nonce, expiresAt)
+	if err != nil {
+		t.Fatalf("TryMarkNonce 首次调用失败: %v", err)
+	}
+	if !firstUse {
+		t.Error("TryMarkNonce 首次调用应返回 firstUse=true")
+	}
+
+	// 重复调用同一 nonce 应返回 firstUse=false（防重放）
+	firstUse, err = s.TryMarkNonce(nonce, expiresAt)
+	if err != nil {
+		t.Fatalf("TryMarkNonce 第二次调用失败: %v", err)
+	}
+	if firstUse {
+		t.Error("TryMarkNonce 重复调用应返回 firstUse=false")
 	}
 }

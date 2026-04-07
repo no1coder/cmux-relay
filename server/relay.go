@@ -58,6 +58,9 @@ func NewRelayWithAPNs(s *store.SQLiteStore, r *Router, a *Authenticator, apns *A
 func (rl *Relay) HandleDeviceWS(conn *websocket.Conn, deviceID string) {
 	defer conn.Close()
 
+	// 限制单条消息最大 1 MB，防止超大消息耗尽内存
+	conn.SetReadLimit(1 * 1024 * 1024)
+
 	// 1. 认证握手
 	secretHash, err := rl.doAuthHandshake(conn, deviceID)
 	if err != nil {
@@ -71,7 +74,7 @@ func (rl *Relay) HandleDeviceWS(conn *websocket.Conn, deviceID string) {
 	if err != nil {
 		if errors.Is(err, store.ErrPairNotFound) {
 			log.Printf("[relay/device] no pair found for device=%s", deviceID)
-			_ = conn.WriteMessage(websocket.TextMessage, marshalSimple("type", "pair_not_found"))
+			_ = conn.WriteMessage(websocket.TextMessage, marshalSimple("type", "pair_not_found")) //nolint:errcheck // 连接即将关闭
 		} else {
 			log.Printf("[relay/device] lookup pair error device=%s: %v", deviceID, err)
 		}
@@ -104,6 +107,16 @@ func (rl *Relay) HandleDeviceWS(conn *websocket.Conn, deviceID string) {
 			continue
 		}
 
+		// 验证 Envelope 必填字段，并确保来源匹配（Mac 端必须发 from=mac）
+		if err := env.Validate(); err != nil {
+			log.Printf("[relay/device] invalid envelope device=%s: %v", deviceID, err)
+			continue
+		}
+		if env.From != protocol.OriginMac {
+			log.Printf("[relay/device] from mismatch device=%s: expected mac, got %s", deviceID, env.From)
+			continue
+		}
+
 		// 转发给手机
 		rl.forwardToPhone(env, deviceID, pair.PhoneID)
 	}
@@ -112,6 +125,9 @@ func (rl *Relay) HandleDeviceWS(conn *websocket.Conn, deviceID string) {
 // HandlePhoneWS 处理 iPhone 的 WebSocket 连接：认证 → 注册 → 消息转发
 func (rl *Relay) HandlePhoneWS(conn *websocket.Conn, phoneID string) {
 	defer conn.Close()
+
+	// 限制单条消息最大 1 MB，防止超大消息耗尽内存
+	conn.SetReadLimit(1 * 1024 * 1024)
 
 	// 1. 认证握手（使用 phoneID 作为 deviceID 参数）
 	_, err := rl.doAuthHandshake(conn, phoneID)
@@ -125,7 +141,7 @@ func (rl *Relay) HandlePhoneWS(conn *websocket.Conn, phoneID string) {
 	if err != nil {
 		if errors.Is(err, store.ErrPairNotFound) {
 			log.Printf("[relay/phone] no pair found for phone=%s", phoneID)
-			_ = conn.WriteMessage(websocket.TextMessage, marshalSimple("type", "pair_not_found"))
+			_ = conn.WriteMessage(websocket.TextMessage, marshalSimple("type", "pair_not_found")) //nolint:errcheck // 连接即将关闭
 		} else {
 			log.Printf("[relay/phone] lookup pair error phone=%s: %v", phoneID, err)
 		}
@@ -155,6 +171,16 @@ func (rl *Relay) HandlePhoneWS(conn *websocket.Conn, phoneID string) {
 		var env protocol.Envelope
 		if err := json.Unmarshal(data, &env); err != nil {
 			log.Printf("[relay/phone] unmarshal error phone=%s: %v", phoneID, err)
+			continue
+		}
+
+		// 验证 Envelope 必填字段，并确保来源匹配（Phone 端必须发 from=phone）
+		if err := env.Validate(); err != nil {
+			log.Printf("[relay/phone] invalid envelope phone=%s: %v", phoneID, err)
+			continue
+		}
+		if env.From != protocol.OriginPhone {
+			log.Printf("[relay/phone] from mismatch phone=%s: expected phone, got %s", phoneID, env.From)
 			continue
 		}
 
@@ -213,31 +239,26 @@ func (rl *Relay) doAuthHandshake(conn *websocket.Conn, clientID string) (string,
 		return "", err
 	}
 
-	// 4. 检查 nonce 是否已被使用（防重放）
-	used, err := rl.store.IsNonceUsed(clientMsg.Nonce)
-	if err != nil {
-		_ = conn.WriteMessage(websocket.TextMessage, marshalSimple("type", "auth_failed"))
-		return "", err
-	}
-	if used {
-		_ = conn.WriteMessage(websocket.TextMessage, marshalSimple("type", "auth_failed"))
-		return "", errors.New("nonce already used")
-	}
-
-	// 5. 验证 HMAC 签名
+	// 4. 验证 HMAC 签名
 	if err := rl.auth.Verify(clientMsg.DeviceID, clientMsg.Nonce, clientMsg.Timestamp, clientMsg.Signature, secretHash); err != nil {
 		_ = conn.WriteMessage(websocket.TextMessage, marshalSimple("type", "auth_failed"))
 		return "", err
 	}
 
-	// 6. 标记 nonce 已使用
-	ts := time.Unix(clientMsg.Timestamp, 0)
-	if err := rl.store.MarkNonceUsed(clientMsg.Nonce, ts); err != nil {
-		log.Printf("[relay] MarkNonceUsed error: %v", err)
-		// 非致命错误，继续
+	// 5. 原子化标记 nonce 已使用（同时完成查重和标记，防重放攻击竞态）
+	// expiresAt = 请求时间戳 + 60 秒
+	nonceExpiresAt := clientMsg.Timestamp + 60
+	firstUse, err := rl.store.TryMarkNonce(clientMsg.Nonce, nonceExpiresAt)
+	if err != nil {
+		_ = conn.WriteMessage(websocket.TextMessage, marshalSimple("type", "auth_failed"))
+		return "", err
+	}
+	if !firstUse {
+		_ = conn.WriteMessage(websocket.TextMessage, marshalSimple("type", "auth_failed"))
+		return "", errors.New("nonce already used")
 	}
 
-	// 7. 发送 auth_ok
+	// 6. 发送 auth_ok
 	if err := conn.WriteMessage(websocket.TextMessage, marshalSimple("type", "auth_ok")); err != nil {
 		return "", err
 	}
@@ -267,13 +288,18 @@ func (rl *Relay) handleResume(conn *websocket.Conn, env protocol.Envelope, devic
 	}
 
 	buf := rl.router.GetOrCreateBuffer(deviceID, phoneID)
+	// 注意：handleResume 通过 pc 指针调用，需要加写锁
+	pc := rl.router.GetPhone(phoneID)
+	if pc == nil {
+		return
+	}
 	msgs := buf.ReplaySince(payload.LastSeq, 100)
 	for _, msg := range msgs {
 		data, err := json.Marshal(msg)
 		if err != nil {
 			continue
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+		if err := pc.SafeWrite(websocket.TextMessage, data); err != nil {
 			log.Printf("[relay] replay write error phone=%s: %v", phoneID, err)
 			return
 		}
@@ -304,7 +330,7 @@ func (rl *Relay) forwardToPhone(env protocol.Envelope, deviceID, phoneID string)
 		log.Printf("[relay] marshal error forwarding to phone=%s: %v", phoneID, err)
 		return
 	}
-	if err := pc.Conn.WriteMessage(websocket.TextMessage, data); err != nil {
+	if err := pc.SafeWrite(websocket.TextMessage, data); err != nil {
 		log.Printf("[relay] write error to phone=%s: %v", phoneID, err)
 	}
 }
@@ -330,11 +356,8 @@ func (rl *Relay) tryAPNsPush(env protocol.Envelope, phoneID string) {
 		return
 	}
 
-	// 提取摘要（payload 的前 200 字节作为摘要）
-	summary := string(env.Payload)
-	if len(summary) > 200 {
-		summary = summary[:200]
-	}
+	// 使用固定的事件类型描述文本作为摘要，不暴露原始 payload 内容
+	summary := pushSummaryForType(string(env.Type))
 
 	if err := rl.apns.SendPush(pair.APNsToken, string(env.Type), summary); err != nil {
 		log.Printf("[relay] apns send push error phone=%s: %v", phoneID, err)
@@ -352,7 +375,7 @@ func (rl *Relay) forwardToDevice(env protocol.Envelope, deviceID string) {
 		log.Printf("[relay] marshal error forwarding to device=%s: %v", deviceID, err)
 		return
 	}
-	if err := dc.Conn.WriteMessage(websocket.TextMessage, data); err != nil {
+	if err := dc.SafeWrite(websocket.TextMessage, data); err != nil {
 		log.Printf("[relay] write error to device=%s: %v", deviceID, err)
 	}
 }
@@ -361,4 +384,20 @@ func (rl *Relay) forwardToDevice(env protocol.Envelope, deviceID string) {
 func marshalSimple(key, value string) []byte {
 	data, _ := json.Marshal(map[string]string{key: value})
 	return data
+}
+
+// pushSummaryForType 根据事件类型返回固定的描述文本，避免将原始 payload 暴露到推送通知
+func pushSummaryForType(eventType string) string {
+	switch eventType {
+	case "approval_required":
+		return "需要您审批操作"
+	case "task_complete":
+		return "任务已完成"
+	case "task_failed":
+		return "任务执行失败"
+	case "terminal_exit":
+		return "终端进程已退出"
+	default:
+		return "您有新的通知"
+	}
 }
