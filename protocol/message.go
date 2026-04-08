@@ -74,13 +74,35 @@ func (e Envelope) IsE2E() bool {
 	return probe.E2E
 }
 
-// Validate 校验 Envelope 的必填字段，任意字段缺失时返回错误。
+// validOrigins 合法的 Origin 枚举值集合
+var validOrigins = map[Origin]bool{
+	OriginMac:   true,
+	OriginPhone: true,
+}
+
+// validMessageTypes 合法的 MessageType 枚举值集合
+var validMessageTypes = map[MessageType]bool{
+	TypeRPCRequest:    true,
+	TypeRPCResponse:   true,
+	TypeEvent:         true,
+	TypeScreenSnapshot: true,
+	TypeResume:        true,
+	TypeAuth:          true,
+}
+
+// Validate 校验 Envelope 的必填字段和枚举值合法性，任意字段非法时返回错误。
 func (e Envelope) Validate() error {
 	if e.From == "" {
 		return errors.New("envelope: From 字段不能为空")
 	}
+	if !validOrigins[e.From] {
+		return errors.New("envelope: From 字段不合法，必须是 mac 或 phone")
+	}
 	if e.Type == "" {
 		return errors.New("envelope: Type 字段不能为空")
+	}
+	if !validMessageTypes[e.Type] {
+		return errors.New("envelope: Type 字段不合法，必须是已知的消息类型")
 	}
 	if len(e.Payload) == 0 {
 		return errors.New("envelope: Payload 字段不能为空")

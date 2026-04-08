@@ -393,6 +393,11 @@ func (rl *Relay) tryAPNsPush(env protocol.Envelope, phoneID string) {
 		}
 	}
 
+	// 截断 summary，防止推送内容过长
+	if len(summary) > 100 {
+		summary = summary[:100]
+	}
+
 	// 查询配对记录，获取 APNs token
 	pair, err := rl.store.LookupPairByPhone(phoneID)
 	if err != nil {

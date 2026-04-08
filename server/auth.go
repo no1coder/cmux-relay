@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -23,6 +24,8 @@ var (
 type Authenticator struct {
 	// maxTimeDrift 允许的最大时间漂移（双向）
 	maxTimeDrift time.Duration
+	// mu 保护 usedNonces 的并发读写
+	mu sync.RWMutex
 	// nonce 去重缓存：防止重放攻击
 	usedNonces map[string]time.Time
 }
@@ -52,10 +55,13 @@ func (a *Authenticator) Verify(deviceID, nonce string, ts int64, signature, secr
 
 	// 安全：nonce 一次性使用，防止重放攻击
 	nonceKey := deviceID + ":" + nonce
+	a.mu.Lock()
 	if _, used := a.usedNonces[nonceKey]; used {
+		a.mu.Unlock()
 		return ErrInvalidSignature
 	}
 	a.usedNonces[nonceKey] = time.Now()
+	a.mu.Unlock()
 
 	// 计算期望的 HMAC 签名
 	expected := computeHMACHex(secretHash, deviceID, nonce, ts)
@@ -105,11 +111,13 @@ func (a *Authenticator) cleanupLoop() {
 	defer ticker.Stop()
 	for range ticker.C {
 		cutoff := time.Now().Add(-a.maxTimeDrift * 2)
+		a.mu.Lock()
 		for k, t := range a.usedNonces {
 			if t.Before(cutoff) {
 				delete(a.usedNonces, k)
 			}
 		}
+		a.mu.Unlock()
 	}
 }
 

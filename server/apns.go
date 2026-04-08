@@ -7,14 +7,19 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 )
+
+// apnsTokenRegex 校验 APNs device token 格式：64 位以上的十六进制字符串
+var apnsTokenRegex = regexp.MustCompile(`^[0-9a-fA-F]{64,}$`)
 
 // pushEventMeta 定义推送事件的元数据
 type pushEventMeta struct {
@@ -134,6 +139,11 @@ func (c *APNsClient) SendPush(deviceToken, eventType, summary string) error {
 		return nil
 	}
 
+	// 校验 deviceToken 格式，防止 URL 注入
+	if !apnsTokenRegex.MatchString(deviceToken) {
+		return fmt.Errorf("apns: invalid device token format")
+	}
+
 	payload := buildAPNsPayload(eventType, summary)
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -168,6 +178,20 @@ func (c *APNsClient) SendPush(deviceToken, eventType, summary string) error {
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		// 读取并解析 APNs 错误响应体，提取 reason 字段
+		var reason string
+		if body, err := io.ReadAll(io.LimitReader(resp.Body, 1024)); err == nil && len(body) > 0 {
+			var apnsErr struct {
+				Reason string `json:"reason"`
+			}
+			if json.Unmarshal(body, &apnsErr) == nil && apnsErr.Reason != "" {
+				reason = apnsErr.Reason
+			}
+		}
+		if reason != "" {
+			log.Printf("[apns] push failed device=%s status=%d reason=%s", tokenPreview, resp.StatusCode, reason)
+			return fmt.Errorf("apns: unexpected status %d reason=%s", resp.StatusCode, reason)
+		}
 		log.Printf("[apns] push failed device=%s status=%d", tokenPreview, resp.StatusCode)
 		return fmt.Errorf("apns: unexpected status %d", resp.StatusCode)
 	}
