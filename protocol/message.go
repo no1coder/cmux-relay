@@ -34,6 +34,16 @@ const (
 	TypeAuth MessageType = "auth"
 )
 
+// PushHint 是明文推送提示，用于 E2E 加密消息的 APNs 路由。
+// 当 payload 被端到端加密时，relay 无法解析 payload 内容，
+// 因此发送端在信封外层附带 push_hint 供 relay 决定是否推送以及推送内容。
+type PushHint struct {
+	// Event 是事件类型，用于匹配推送规则
+	Event string `json:"event"`
+	// Summary 是推送摘要文本
+	Summary string `json:"summary"`
+}
+
 // Envelope 是 cmux-relay 中所有消息的通用信封结构，包裹业务 Payload。
 type Envelope struct {
 	// Seq 是消息的单调递增序列号，用于排序和去重
@@ -44,8 +54,24 @@ type Envelope struct {
 	From Origin `json:"from"`
 	// Type 表示消息的业务类型
 	Type MessageType `json:"type"`
+	// PushHintData 是明文推送提示，仅在 E2E 加密消息中使用
+	PushHintData *PushHint `json:"push_hint,omitempty"`
 	// Payload 是消息的业务数据，使用原始 JSON 延迟解析
 	Payload json.RawMessage `json:"payload"`
+}
+
+// IsE2E 检查 payload 是否为端到端加密格式（包含 "e2e": true）
+func (e Envelope) IsE2E() bool {
+	if len(e.Payload) == 0 {
+		return false
+	}
+	var probe struct {
+		E2E bool `json:"e2e"`
+	}
+	if err := json.Unmarshal(e.Payload, &probe); err != nil {
+		return false
+	}
+	return probe.E2E
 }
 
 // Validate 校验 Envelope 的必填字段，任意字段缺失时返回错误。

@@ -343,15 +343,35 @@ func (rl *Relay) forwardToPhone(env protocol.Envelope, deviceID, phoneID string)
 	}
 }
 
-// tryAPNsPush 在 Phone 不在线时，检查是否需要推送并发送 APNs 通知
+// tryAPNsPush 在 Phone 不在线时，检查是否需要推送并发送 APNs 通知。
+// 对于 E2E 加密消息，使用信封中的 push_hint 明文字段进行推送路由。
 func (rl *Relay) tryAPNsPush(env protocol.Envelope, phoneID string) {
-	// 检查事件类型是否需要推送
-	if !shouldPush(string(env.Type)) {
-		return
-	}
 	// APNs 客户端未配置
 	if rl.apns == nil {
 		return
+	}
+
+	// 确定推送的事件类型和摘要
+	var eventType, summary string
+
+	if env.IsE2E() {
+		// E2E 加密消息：payload 不可解析，依赖 push_hint 明文字段
+		if env.PushHintData == nil {
+			// 没有 push_hint，不推送
+			return
+		}
+		eventType = env.PushHintData.Event
+		summary = env.PushHintData.Summary
+		if !shouldPush(eventType) {
+			return
+		}
+	} else {
+		// 非加密消息：使用 envelope 的 Type 字段判断
+		if !shouldPush(string(env.Type)) {
+			return
+		}
+		eventType = string(env.Type)
+		summary = pushSummaryForType(eventType)
 	}
 
 	// 查询配对记录，获取 APNs token
@@ -364,10 +384,7 @@ func (rl *Relay) tryAPNsPush(env protocol.Envelope, phoneID string) {
 		return
 	}
 
-	// 使用固定的事件类型描述文本作为摘要，不暴露原始 payload 内容
-	summary := pushSummaryForType(string(env.Type))
-
-	if err := rl.apns.SendPush(pair.APNsToken, string(env.Type), summary); err != nil {
+	if err := rl.apns.SendPush(pair.APNsToken, eventType, summary); err != nil {
 		log.Printf("[relay] apns send push error phone=%s: %v", phoneID, err)
 	}
 }
