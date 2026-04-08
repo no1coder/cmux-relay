@@ -28,6 +28,7 @@ var pushEventMap = map[string]pushEventMeta{
 	"task_complete":     {Title: "任务完成", Category: "TASK_COMPLETE"},
 	"task_failed":       {Title: "任务失败", Category: "TASK_FAILED"},
 	"terminal_exit":     {Title: "终端退出", Category: "TERMINAL_EXIT"},
+	"notification":      {Title: "终端通知", Category: "TERMINAL_NOTIFICATION"},
 }
 
 // shouldPush 判断事件类型是否需要推送通知
