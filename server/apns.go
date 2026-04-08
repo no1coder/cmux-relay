@@ -162,12 +162,17 @@ func (c *APNsClient) SendPush(deviceToken, eventType, summary string) error {
 	}
 	defer resp.Body.Close()
 
+	tokenPreview := deviceToken
+	if len(tokenPreview) > 16 {
+		tokenPreview = tokenPreview[:16]
+	}
+
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("[apns] push failed device=%s status=%d", deviceToken[:16], resp.StatusCode)
+		log.Printf("[apns] push failed device=%s status=%d", tokenPreview, resp.StatusCode)
 		return fmt.Errorf("apns: unexpected status %d", resp.StatusCode)
 	}
 
-	log.Printf("[apns] push sent device=%s event=%s", deviceToken[:16], eventType)
+	log.Printf("[apns] push sent device=%s event=%s", tokenPreview, eventType)
 	return nil
 }
 

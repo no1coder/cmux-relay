@@ -366,12 +366,31 @@ func (rl *Relay) tryAPNsPush(env protocol.Envelope, phoneID string) {
 			return
 		}
 	} else {
-		// 非加密消息：使用 envelope 的 Type 字段判断
-		if !shouldPush(string(env.Type)) {
+		// 非加密消息：优先使用 push_hint，否则尝试从 payload 中解析事件子类型
+		if env.PushHintData != nil {
+			eventType = env.PushHintData.Event
+			summary = env.PushHintData.Summary
+		} else {
+			// 尝试从 payload 中提取业务事件子类型
+			var payloadMap map[string]interface{}
+			if err := json.Unmarshal(env.Payload, &payloadMap); err == nil {
+				if evt, ok := payloadMap["event"].(string); ok {
+					eventType = evt
+				}
+				if sum, ok := payloadMap["summary"].(string); ok {
+					summary = sum
+				}
+			}
+			if eventType == "" {
+				eventType = string(env.Type)
+			}
+			if summary == "" {
+				summary = pushSummaryForType(eventType)
+			}
+		}
+		if !shouldPush(eventType) {
 			return
 		}
-		eventType = string(env.Type)
-		summary = pushSummaryForType(eventType)
 	}
 
 	// 查询配对记录，获取 APNs token
@@ -422,6 +441,8 @@ func pushSummaryForType(eventType string) string {
 		return "任务执行失败"
 	case "terminal_exit":
 		return "终端进程已退出"
+	case "notification":
+		return "终端命令完成"
 	default:
 		return "您有新的通知"
 	}
