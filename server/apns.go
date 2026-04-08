@@ -2,17 +2,23 @@ package server
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // pushEventMeta 定义推送事件的元数据
 type pushEventMeta struct {
-	// Title 是推送通知的标题
-	Title string
-	// Category 是 APNs 的通知分类
+	Title    string
 	Category string
 }
 
@@ -36,28 +42,94 @@ type APNsClient struct {
 	teamID     string
 	keyID      string
 	bundleID   string
+	privateKey *ecdsa.PrivateKey
+
+	// JWT 缓存（有效期 50 分钟，APNs 允许 60 分钟）
+	mu             sync.Mutex
+	cachedToken    string
+	tokenExpiresAt time.Time
 }
 
 // NewAPNsClient 创建 APNsClient 实例
-// teamID、keyID、bundleID 为空时，SendPush 会静默返回 nil
-func NewAPNsClient(teamID, keyID, bundleID string) *APNsClient {
-	return &APNsClient{
-		httpClient: &http.Client{},
+// keyPath 为 p8 私钥文件路径；如果任何参数为空，SendPush 静默返回 nil
+func NewAPNsClient(teamID, keyID, bundleID, keyPath string) *APNsClient {
+	c := &APNsClient{
+		httpClient: &http.Client{Timeout: 30 * time.Second},
 		teamID:     teamID,
 		keyID:      keyID,
 		bundleID:   bundleID,
 	}
+
+	if keyPath != "" {
+		key, err := loadP8Key(keyPath)
+		if err != nil {
+			log.Printf("[apns] 加载 p8 私钥失败: %v", err)
+		} else {
+			c.privateKey = key
+			log.Printf("[apns] p8 私钥加载成功 teamID=%s keyID=%s bundleID=%s", teamID, keyID, bundleID)
+		}
+	}
+
+	return c
 }
 
-// SendPush 向设备推送通知。
-// 如果 bundleID、teamID 或 keyID 未配置，则静默返回 nil（功能关闭）。
-func (c *APNsClient) SendPush(deviceToken, eventType, summary string) error {
-	// 未配置时静默跳过
-	if c == nil || c.bundleID == "" {
-		return nil
+// loadP8Key 从 .p8 文件加载 ECDSA P-256 私钥
+func loadP8Key(path string) (*ecdsa.PrivateKey, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("读取文件: %w", err)
 	}
-	// teamID 或 keyID 缺失时无法生成有效 JWT，提前返回避免发送无效请求
-	if c.teamID == "" || c.keyID == "" {
+
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, fmt.Errorf("无法解码 PEM")
+	}
+
+	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("解析私钥: %w", err)
+	}
+
+	ecKey, ok := key.(*ecdsa.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("私钥不是 ECDSA 类型")
+	}
+
+	return ecKey, nil
+}
+
+// generateJWT 生成 APNs JWT token（ES256 签名）
+func (c *APNsClient) generateJWT() (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// 缓存有效则直接返回
+	if c.cachedToken != "" && time.Now().Before(c.tokenExpiresAt) {
+		return c.cachedToken, nil
+	}
+
+	now := time.Now()
+	token := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{
+		"iss": c.teamID,
+		"iat": now.Unix(),
+	})
+	token.Header["kid"] = c.keyID
+
+	signed, err := token.SignedString(c.privateKey)
+	if err != nil {
+		return "", fmt.Errorf("JWT 签名失败: %w", err)
+	}
+
+	// 缓存 50 分钟（APNs 允许 60 分钟）
+	c.cachedToken = signed
+	c.tokenExpiresAt = now.Add(50 * time.Minute)
+
+	return signed, nil
+}
+
+// SendPush 向设备推送通知
+func (c *APNsClient) SendPush(deviceToken, eventType, summary string) error {
+	if c == nil || c.bundleID == "" || c.privateKey == nil {
 		return nil
 	}
 
@@ -67,11 +139,10 @@ func (c *APNsClient) SendPush(deviceToken, eventType, summary string) error {
 		return fmt.Errorf("apns: marshal payload: %w", err)
 	}
 
-	// TODO: 实现 JWT token 签名（需要 p8 私钥）
-	// JWT header: {"alg":"ES256","kid":"<keyID>"}
-	// JWT claims: {"iss":"<teamID>","iat":<unix_timestamp>}
-	// 用 ECDSA P-256 私钥签名后，作为 Bearer token 发送
-	jwtToken := "TODO_JWT_TOKEN"
+	jwtToken, err := c.generateJWT()
+	if err != nil {
+		return fmt.Errorf("apns: generate jwt: %w", err)
+	}
 
 	url := fmt.Sprintf("https://api.push.apple.com/3/device/%s", deviceToken)
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
@@ -91,18 +162,17 @@ func (c *APNsClient) SendPush(deviceToken, eventType, summary string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("[apns] push failed device=%s status=%d", deviceToken, resp.StatusCode)
+		log.Printf("[apns] push failed device=%s status=%d", deviceToken[:16], resp.StatusCode)
 		return fmt.Errorf("apns: unexpected status %d", resp.StatusCode)
 	}
 
-	log.Printf("[apns] push sent device=%s event=%s", deviceToken, eventType)
+	log.Printf("[apns] push sent device=%s event=%s", deviceToken[:16], eventType)
 	return nil
 }
 
 // buildAPNsPayload 根据事件类型和摘要构建 APNs JSON payload
 func buildAPNsPayload(eventType, summary string) map[string]interface{} {
 	meta, ok := pushEventMap[eventType]
-	// 未知事件类型使用默认值
 	if !ok {
 		meta = pushEventMeta{Title: "cmux 通知", Category: "GENERAL"}
 	}

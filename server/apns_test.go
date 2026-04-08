@@ -133,7 +133,7 @@ func TestShouldPush(t *testing.T) {
 // TestAPNsClient_SendPush_NotConfigured 验证未配置时静默返回 nil
 func TestAPNsClient_SendPush_NotConfigured(t *testing.T) {
 	// bundleID 为空时应静默返回 nil
-	client := NewAPNsClient("TEAM123", "KEY123", "")
+	client := NewAPNsClient("TEAM123", "KEY123", "", "")
 	err := client.SendPush("device-token", "approval_required", "test")
 	if err != nil {
 		t.Errorf("未配置时期望 err=nil，实际 err=%v", err)

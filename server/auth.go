@@ -23,11 +23,19 @@ var (
 type Authenticator struct {
 	// maxTimeDrift 允许的最大时间漂移（双向）
 	maxTimeDrift time.Duration
+	// nonce 去重缓存：防止重放攻击
+	usedNonces map[string]time.Time
 }
 
 // NewAuthenticator 创建新的 Authenticator，maxDrift 指定允许的最大时间漂移
 func NewAuthenticator(maxDrift time.Duration) *Authenticator {
-	return &Authenticator{maxTimeDrift: maxDrift}
+	a := &Authenticator{
+		maxTimeDrift: maxDrift,
+		usedNonces:   make(map[string]time.Time),
+	}
+	// 后台清理过期 nonce（每分钟清理一次）
+	go a.cleanupLoop()
+	return a
 }
 
 // Verify 验证请求的合法性：
@@ -41,6 +49,13 @@ func (a *Authenticator) Verify(deviceID, nonce string, ts int64, signature, secr
 	if drift > a.maxTimeDrift {
 		return ErrTimestampDrift
 	}
+
+	// 安全：nonce 一次性使用，防止重放攻击
+	nonceKey := deviceID + ":" + nonce
+	if _, used := a.usedNonces[nonceKey]; used {
+		return ErrInvalidSignature
+	}
+	a.usedNonces[nonceKey] = time.Now()
 
 	// 计算期望的 HMAC 签名
 	expected := computeHMACHex(secretHash, deviceID, nonce, ts)
@@ -82,6 +97,20 @@ func computeHMACHex(secretHash, deviceID, nonce string, ts int64) string {
 	mac := hmac.New(sha256.New, []byte(secretHash))
 	mac.Write([]byte(fmt.Sprintf("%s:%s:%d", deviceID, nonce, ts)))
 	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// cleanupLoop 定期清理过期 nonce
+func (a *Authenticator) cleanupLoop() {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		cutoff := time.Now().Add(-a.maxTimeDrift * 2)
+		for k, t := range a.usedNonces {
+			if t.Before(cutoff) {
+				delete(a.usedNonces, k)
+			}
+		}
+	}
 }
 
 // abs 返回 int64 的绝对值

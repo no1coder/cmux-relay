@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -44,8 +45,16 @@ func NewServer(dbPath string) (*Server, error) {
 	// 认证器，允许最大 10 秒时间漂移
 	auth := NewAuthenticator(10 * time.Second)
 
+	// APNs 推送客户端（从环境变量读取配置）
+	apnsClient := NewAPNsClient(
+		os.Getenv("APNS_TEAM_ID"),
+		os.Getenv("APNS_KEY_ID"),
+		os.Getenv("APNS_BUNDLE_ID"),
+		os.Getenv("APNS_KEY_PATH"),
+	)
+
 	// 中继引擎
-	relay := NewRelay(s, r, auth)
+	relay := NewRelayWithAPNs(s, r, auth, apnsClient)
 
 	// 配对 API 处理器
 	pairing := NewPairHandler(s, r)
