@@ -4,6 +4,10 @@ FROM golang:1.25-alpine AS builder
 RUN apk add --no-cache gcc musl-dev sqlite-dev
 
 WORKDIR /build
+
+# 使用国内 Go 代理加速依赖下载
+ENV GOPROXY=https://goproxy.cn,direct
+
 COPY go.mod go.sum ./
 RUN go mod download
 
