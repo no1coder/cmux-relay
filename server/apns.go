@@ -200,6 +200,65 @@ func (c *APNsClient) SendPush(deviceToken, eventType, summary string) error {
 	return nil
 }
 
+// SendLiveActivityUpdate 通过 APNs HTTP/2 更新 Live Activity
+func (c *APNsClient) SendLiveActivityUpdate(liveActivityToken string, contentState map[string]interface{}, event string) error {
+	if c == nil || c.bundleID == "" || c.privateKey == nil {
+		return nil
+	}
+	if !apnsTokenRegex.MatchString(liveActivityToken) {
+		return fmt.Errorf("apns: invalid live activity token")
+	}
+
+	// Live Activity APNs payload
+	payload := map[string]interface{}{
+		"aps": map[string]interface{}{
+			"timestamp":     time.Now().Unix(),
+			"event":         event, // "update" or "end"
+			"content-state": contentState,
+		},
+	}
+	if event == "end" {
+		payload["aps"].(map[string]interface{})["dismissal-date"] = time.Now().Add(5 * time.Second).Unix()
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("apns: marshal: %w", err)
+	}
+
+	jwtToken, err := c.generateJWT()
+	if err != nil {
+		return fmt.Errorf("apns: jwt: %w", err)
+	}
+
+	url := fmt.Sprintf("https://api.push.apple.com/3/device/%s", liveActivityToken)
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("apns: request: %w", err)
+	}
+
+	// Live Activity 使用不同的 push-type 和 topic
+	req.Header.Set("apns-topic", c.bundleID+".push-type.liveactivity")
+	req.Header.Set("apns-push-type", "liveactivity")
+	req.Header.Set("apns-priority", "10")
+	req.Header.Set("authorization", "bearer "+jwtToken)
+	req.Header.Set("content-type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("apns: http: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("apns: live activity status=%d body=%s", resp.StatusCode, string(respBody))
+	}
+
+	log.Printf("[apns] live activity updated event=%s", event)
+	return nil
+}
+
 // buildAPNsPayload 根据事件类型和摘要构建 APNs JSON payload
 func buildAPNsPayload(eventType, summary string) map[string]interface{} {
 	meta, ok := pushEventMap[eventType]

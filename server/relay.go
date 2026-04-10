@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -326,6 +327,11 @@ func (rl *Relay) forwardToPhone(env protocol.Envelope, deviceID, phoneID string)
 	buf := rl.router.GetOrCreateBuffer(deviceID, phoneID)
 	buf.Push(env)
 
+	// 阶段事件始终触发 Live Activity 更新（不管手机是否在线）
+	if env.Type == protocol.TypeEvent {
+		go rl.handlePhaseEvent(env, phoneID)
+	}
+
 	// 发送给在线 Phone
 	pc := rl.router.GetPhone(phoneID)
 	if pc == nil {
@@ -411,6 +417,98 @@ func (rl *Relay) tryAPNsPush(env protocol.Envelope, phoneID string) {
 	if err := rl.apns.SendPush(pair.APNsToken, eventType, summary); err != nil {
 		log.Printf("[relay] apns send push error phone=%s: %v", phoneID, err)
 	}
+}
+
+// handlePhaseEvent 处理 phase.update 事件，触发 Live Activity 更新和 APNs 推送
+func (rl *Relay) handlePhaseEvent(env protocol.Envelope, phoneID string) {
+	if rl.apns == nil {
+		return
+	}
+
+	// 解析 payload 提取事件信息
+	var payload map[string]interface{}
+	if err := json.Unmarshal(env.Payload, &payload); err != nil {
+		return
+	}
+
+	eventName, _ := payload["event"].(string)
+	if eventName != "phase.update" {
+		return
+	}
+
+	phase, _ := payload["phase"].(string)
+	if phase == "" {
+		return
+	}
+
+	// 1. 更新 Live Activity
+	laToken, err := rl.store.LookupLiveActivityToken(phoneID)
+	if err == nil && laToken != "" {
+		contentState := map[string]interface{}{
+			"activeSessionId":      payload["surface_id"],
+			"projectName":          payload["project_name"],
+			"phase":                phase,
+			"toolName":             payload["tool_name"],
+			"lastUserMessage":      payload["last_user_message"],
+			"lastAssistantSummary": payload["last_assistant_summary"],
+			"totalSessions":        1,
+			"activeSessions":       1,
+			"startedAt":            float64(time.Now().Unix()),
+		}
+
+		event := "update"
+		if phase == "ended" {
+			event = "end"
+		}
+
+		if err := rl.apns.SendLiveActivityUpdate(laToken, contentState, event); err != nil {
+			log.Printf("[relay] live activity update failed phone=%s: %v", phoneID[:10], err)
+			// 终端错误时清除 token
+			if isTerminalAPNsError(err) {
+				_ = rl.store.UpdateLiveActivityToken(phoneID, "")
+				log.Printf("[relay] cleared invalid LA token phone=%s", phoneID[:10])
+			}
+		}
+	}
+
+	// 2. 发送 APNs 推送通知（仅特定阶段）
+	switch phase {
+	case "ended":
+		summary, _ := payload["last_assistant_summary"].(string)
+		if summary == "" {
+			summary = "Claude 已完成"
+		}
+		rl.apns.SendPush(rl.lookupAPNsToken(phoneID), "task_complete", summary) //nolint:errcheck
+	case "waiting_approval":
+		toolName, _ := payload["tool_name"].(string)
+		summary := "需要审批"
+		if toolName != "" {
+			summary = "需要审批: " + toolName
+		}
+		rl.apns.SendPush(rl.lookupAPNsToken(phoneID), "approval_required", summary) //nolint:errcheck
+	case "error":
+		rl.apns.SendPush(rl.lookupAPNsToken(phoneID), "task_failed", "执行出错") //nolint:errcheck
+	}
+}
+
+// lookupAPNsToken 查找 APNs push token
+func (rl *Relay) lookupAPNsToken(phoneID string) string {
+	pair, err := rl.store.LookupPairByPhone(phoneID)
+	if err != nil {
+		return ""
+	}
+	return pair.APNsToken
+}
+
+// isTerminalAPNsError 检测 APNs 终端错误（token 永久失效）
+func isTerminalAPNsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "status=410") ||
+		strings.Contains(s, "BadDeviceToken") ||
+		strings.Contains(s, "DeviceTokenNotForTopic")
 }
 
 // forwardToDevice 将消息发送给在线 Mac 设备
