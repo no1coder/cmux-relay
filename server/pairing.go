@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -191,13 +192,28 @@ func (h *PairHandler) HandlePairCheck(w http.ResponseWriter, r *http.Request) {
 
 // HandlePairDelete 处理 DELETE /api/pair/{phone_id}
 // 解除配对，关闭 Phone 连接，通知 Mac
-// TODO(security): 添加 HMAC 签名认证（X-Signature + X-Timestamp），防止未授权删除配对
+// 需要 HMAC 签名认证（X-Phone-ID + X-Timestamp + X-Signature）
 func (h *PairHandler) HandlePairDelete(w http.ResponseWriter, r *http.Request) {
+	// 验证 HMAC 签名
+	authPhoneID := r.Header.Get("X-Phone-ID")
+	tsStr := r.Header.Get("X-Timestamp")
+	signature := r.Header.Get("X-Signature")
+	if authPhoneID == "" || tsStr == "" || signature == "" {
+		writeError(w, http.StatusUnauthorized, "missing auth headers")
+		return
+	}
+
 	// 从 URL path 末尾提取 phone_id
 	phoneID := strings.TrimPrefix(r.URL.Path, "/api/pair/")
 	phoneID = strings.TrimSpace(phoneID)
 	if phoneID == "" {
 		writeError(w, http.StatusBadRequest, "phone_id is required")
+		return
+	}
+
+	// 签名中的 phoneID 必须与 URL 中的一致
+	if authPhoneID != phoneID {
+		writeError(w, http.StatusForbidden, "phone_id mismatch")
 		return
 	}
 
@@ -209,6 +225,23 @@ func (h *PairHandler) HandlePairDelete(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("[pairing] LookupPairByPhone error: %v", err)
 		writeError(w, http.StatusInternalServerError, "failed to lookup pair")
+		return
+	}
+
+	// 验证 HMAC 签名
+	var ts int64
+	if _, err := fmt.Sscanf(tsStr, "%d", &ts); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid timestamp")
+		return
+	}
+	drift := time.Duration(abs(time.Now().Unix()-ts)) * time.Second
+	if drift > 60*time.Second {
+		writeError(w, http.StatusUnauthorized, "timestamp expired")
+		return
+	}
+	expected := computeHMACHex(pair.SecretHash, phoneID, r.URL.Path, ts)
+	if expected != signature {
+		writeError(w, http.StatusUnauthorized, "invalid signature")
 		return
 	}
 

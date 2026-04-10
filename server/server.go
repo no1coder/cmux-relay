@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -143,6 +144,15 @@ func (srv *Server) Handler() http.Handler {
 		srv.handlePushToken(w, r)
 	})
 
+	// Live Activity push token 存储
+	mux.HandleFunc("/api/push/live-activity-token", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		srv.handleLiveActivityToken(w, r)
+	})
+
 	// WebSocket 端点
 	mux.HandleFunc("/ws/device/", srv.handleDeviceWS)
 	mux.HandleFunc("/ws/phone/", srv.handlePhoneWS)
@@ -156,16 +166,69 @@ type pushTokenRequest struct {
 	APNsToken string `json:"apns_token"`
 }
 
+// verifyHTTPHMAC 验证 HTTP 请求的 HMAC 签名
+// 请求头必须包含 X-Phone-ID、X-Timestamp、X-Signature
+// 签名消息格式：phoneID:timestamp:path
+func (srv *Server) verifyHTTPHMAC(w http.ResponseWriter, r *http.Request) (phoneID string, ok bool) {
+	phoneID = r.Header.Get("X-Phone-ID")
+	tsStr := r.Header.Get("X-Timestamp")
+	signature := r.Header.Get("X-Signature")
+
+	if phoneID == "" || tsStr == "" || signature == "" {
+		http.Error(w, "missing auth headers: X-Phone-ID, X-Timestamp, X-Signature", http.StatusUnauthorized)
+		return "", false
+	}
+
+	// 查找配对记录获取 secretHash
+	pair, err := srv.store.LookupPairByPhone(phoneID)
+	if err != nil {
+		http.Error(w, "unauthorized: unknown phone_id", http.StatusUnauthorized)
+		return "", false
+	}
+
+	// 验证时间戳漂移（60 秒容差）
+	var ts int64
+	if _, err := fmt.Sscanf(tsStr, "%d", &ts); err != nil {
+		http.Error(w, "invalid timestamp", http.StatusBadRequest)
+		return "", false
+	}
+	drift := time.Duration(abs(time.Now().Unix()-ts)) * time.Second
+	if drift > 60*time.Second {
+		http.Error(w, "timestamp expired", http.StatusUnauthorized)
+		return "", false
+	}
+
+	// 计算并验证 HMAC：使用 secretHash 签名 phoneID:timestamp:path
+	expected := computeHMACHex(pair.SecretHash, phoneID, r.URL.Path, ts)
+	if expected != signature {
+		http.Error(w, "invalid signature", http.StatusUnauthorized)
+		return "", false
+	}
+
+	return phoneID, true
+}
+
 // handlePushToken 解析请求体并更新配对记录中的 APNs token
-// TODO(security): 添加 HMAC 签名认证（X-Signature + X-Timestamp），防止未授权更新 APNs token
+// 需要 HMAC 签名认证（X-Phone-ID + X-Timestamp + X-Signature）
 func (srv *Server) handlePushToken(w http.ResponseWriter, r *http.Request) {
+	// 验证 HMAC 签名
+	authPhoneID, ok := srv.verifyHTTPHMAC(w, r)
+	if !ok {
+		return
+	}
+
 	var req pushTokenRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
 	if req.PhoneID == "" || req.APNsToken == "" {
 		http.Error(w, "phone_id and apns_token are required", http.StatusBadRequest)
+		return
+	}
+	// 确保请求体中的 phoneID 与签名中的一致
+	if req.PhoneID != authPhoneID {
+		http.Error(w, "phone_id mismatch", http.StatusForbidden)
 		return
 	}
 
@@ -175,6 +238,42 @@ func (srv *Server) handlePushToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// handleLiveActivityToken 解析请求体并更新配对记录中的 Live Activity token
+// 需要 HMAC 签名认证（X-Phone-ID + X-Timestamp + X-Signature）
+func (srv *Server) handleLiveActivityToken(w http.ResponseWriter, r *http.Request) {
+	phoneID, ok := srv.verifyHTTPHMAC(w, r)
+	if !ok {
+		return
+	}
+
+	var req struct {
+		PhoneID   string `json:"phone_id"`
+		Token     string `json:"token"`
+		SessionID string `json:"session_id"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.PhoneID == "" || req.Token == "" {
+		http.Error(w, "phone_id and token are required", http.StatusBadRequest)
+		return
+	}
+	if req.PhoneID != phoneID {
+		http.Error(w, "phone_id mismatch", http.StatusForbidden)
+		return
+	}
+
+	if err := srv.store.UpdateLiveActivityToken(req.PhoneID, req.Token); err != nil {
+		log.Printf("[server] UpdateLiveActivityToken error phone=%s: %v", req.PhoneID[:10], err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[server] live activity token updated phone=%s", req.PhoneID[:10])
 	w.WriteHeader(http.StatusAccepted)
 }
 

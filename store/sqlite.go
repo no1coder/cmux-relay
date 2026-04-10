@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -33,6 +34,8 @@ type Pair struct {
 	SecretHash string
 	// APNsToken 是 iPhone 的 APNs 推送令牌
 	APNsToken string
+	// LiveActivityToken 是 iPhone 的 Live Activity 推送令牌
+	LiveActivityToken string
 	// CreatedAt 是配对创建时间
 	CreatedAt time.Time
 }
@@ -105,7 +108,12 @@ func (s *SQLiteStore) migrate() error {
 			expires_at  INTEGER NOT NULL
 		);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	// Live Activity token 支持
+	_, _ = s.db.Exec(`ALTER TABLE pairs ADD COLUMN live_activity_token TEXT DEFAULT ''`)
+	return nil
 }
 
 // SavePair 保存或更新配对记录
@@ -127,7 +135,8 @@ func (s *SQLiteStore) SavePair(p Pair) error {
 // LookupPairByDevice 通过 Mac 设备 ID 查询配对记录
 func (s *SQLiteStore) LookupPairByDevice(deviceID string) (Pair, error) {
 	row := s.db.QueryRow(`
-		SELECT device_id, device_name, phone_id, phone_name, secret_hash, apns_token, created_at
+		SELECT device_id, device_name, phone_id, phone_name, secret_hash, apns_token,
+		       COALESCE(live_activity_token, ''), created_at
 		FROM pairs WHERE device_id = ?`, deviceID)
 	return scanPair(row)
 }
@@ -135,7 +144,8 @@ func (s *SQLiteStore) LookupPairByDevice(deviceID string) (Pair, error) {
 // LookupPairByPhone 通过 iPhone ID 查询配对记录
 func (s *SQLiteStore) LookupPairByPhone(phoneID string) (Pair, error) {
 	row := s.db.QueryRow(`
-		SELECT device_id, device_name, phone_id, phone_name, secret_hash, apns_token, created_at
+		SELECT device_id, device_name, phone_id, phone_name, secret_hash, apns_token,
+		       COALESCE(live_activity_token, ''), created_at
 		FROM pairs WHERE phone_id = ?`, phoneID)
 	return scanPair(row)
 }
@@ -148,6 +158,7 @@ func scanPair(row *sql.Row) (Pair, error) {
 		&p.DeviceID, &p.DeviceName,
 		&p.PhoneID, &p.PhoneName,
 		&p.SecretHash, &p.APNsToken,
+		&p.LiveActivityToken,
 		&createdAtUnix,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -275,6 +286,38 @@ func (s *SQLiteStore) UpdateAPNsToken(phoneID, token string) error {
 		return ErrPairNotFound
 	}
 	return nil
+}
+
+// UpdateLiveActivityToken 更新 Live Activity push token
+func (s *SQLiteStore) UpdateLiveActivityToken(phoneID, token string) error {
+	result, err := s.db.Exec(
+		`UPDATE pairs SET live_activity_token = ? WHERE phone_id = ?`,
+		token, phoneID,
+	)
+	if err != nil {
+		return fmt.Errorf("update live activity token: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrPairNotFound
+	}
+	return nil
+}
+
+// LookupLiveActivityToken 获取 Live Activity push token
+func (s *SQLiteStore) LookupLiveActivityToken(phoneID string) (string, error) {
+	row := s.db.QueryRow(`SELECT COALESCE(live_activity_token, '') FROM pairs WHERE phone_id = ?`, phoneID)
+	var token string
+	if err := row.Scan(&token); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrPairNotFound
+		}
+		return "", err
+	}
+	return token, nil
 }
 
 // SavePendingSecret 暂存配对密钥，供 Mac 轮询取回（有效期 5 分钟）
