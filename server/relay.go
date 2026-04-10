@@ -14,7 +14,7 @@ import (
 )
 
 // authTimeout 是 WebSocket 握手认证的超时时间
-const authTimeout = 10 * time.Second
+const authTimeout = 30 * time.Second
 
 // authChallengeMsg 是服务端发送给客户端的认证挑战消息
 type authChallengeMsg struct {

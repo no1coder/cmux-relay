@@ -43,8 +43,8 @@ func NewServer(dbPath string) (*Server, error) {
 	// 初始化路由表
 	r := NewRouter()
 
-	// 认证器，允许最大 10 秒时间漂移
-	auth := NewAuthenticator(10 * time.Second)
+	// 认证器，允许最大 30 秒时间漂移（网络慢时 HMAC 签名可能延迟到达）
+	auth := NewAuthenticator(30 * time.Second)
 
 	// APNs 推送客户端（从环境变量读取配置）
 	apnsClient := NewAPNsClient(
