@@ -126,6 +126,116 @@ func TestPairTokenLifecycle(t *testing.T) {
 	}
 }
 
+// TestUpdateLiveActivityToken 测试更新 Live Activity token 后可查询到新值
+func TestUpdateLiveActivityToken(t *testing.T) {
+	s := newTestStore(t)
+
+	// 先创建配对记录
+	err := s.SavePair(store.Pair{
+		DeviceID: "mac1", DeviceName: "Mac", PhoneID: "phone1", PhoneName: "iPhone",
+		SecretHash: "hash", APNsToken: "apns-token-1", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 更新 LA token
+	err = s.UpdateLiveActivityToken("phone1", "la-token-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 验证查询到新值
+	token, err := s.LookupLiveActivityToken("phone1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "la-token-123" {
+		t.Errorf("期望 la-token-123，实际 %s", token)
+	}
+}
+
+// TestUpdateLiveActivityToken_NotFound 测试更新不存在的 phone 返回 ErrPairNotFound
+func TestUpdateLiveActivityToken_NotFound(t *testing.T) {
+	s := newTestStore(t)
+
+	err := s.UpdateLiveActivityToken("nonexistent", "token")
+	if err != store.ErrPairNotFound {
+		t.Errorf("期望 ErrPairNotFound，实际 %v", err)
+	}
+}
+
+// TestLookupLiveActivityToken_Empty 测试未设置 LA token 时返回空字符串
+func TestLookupLiveActivityToken_Empty(t *testing.T) {
+	s := newTestStore(t)
+
+	// 创建配对但不设置 LA token
+	_ = s.SavePair(store.Pair{
+		DeviceID: "mac1", DeviceName: "Mac", PhoneID: "phone1", PhoneName: "iPhone",
+		SecretHash: "hash", APNsToken: "apns", CreatedAt: time.Now(),
+	})
+
+	token, err := s.LookupLiveActivityToken("phone1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "" {
+		t.Errorf("期望空字符串，实际 %s", token)
+	}
+}
+
+// TestLookupLiveActivityToken_NotFound 测试查询不存在 phone 的 LA token 返回 ErrPairNotFound
+func TestLookupLiveActivityToken_NotFound(t *testing.T) {
+	s := newTestStore(t)
+
+	_, err := s.LookupLiveActivityToken("nonexistent-phone")
+	if err != store.ErrPairNotFound {
+		t.Errorf("期望 ErrPairNotFound，实际 %v", err)
+	}
+}
+
+// TestUpdateLiveActivityToken_Overwrite 测试多次更新 LA token 只保留最新值
+func TestUpdateLiveActivityToken_Overwrite(t *testing.T) {
+	s := newTestStore(t)
+
+	_ = s.SavePair(store.Pair{
+		DeviceID: "mac1", DeviceName: "Mac", PhoneID: "phone1", PhoneName: "iPhone",
+		SecretHash: "hash", APNsToken: "apns", CreatedAt: time.Now(),
+	})
+
+	// 第一次更新
+	_ = s.UpdateLiveActivityToken("phone1", "token-v1")
+	// 第二次更新（覆盖）
+	_ = s.UpdateLiveActivityToken("phone1", "token-v2")
+
+	token, err := s.LookupLiveActivityToken("phone1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "token-v2" {
+		t.Errorf("期望 token-v2，实际 %s", token)
+	}
+}
+
+// TestLiveActivityToken_ReflectedInLookupPairByPhone 测试通过 LookupPairByPhone 也能读取 LA token
+func TestLiveActivityToken_ReflectedInLookupPairByPhone(t *testing.T) {
+	s := newTestStore(t)
+
+	_ = s.SavePair(store.Pair{
+		DeviceID: "mac1", DeviceName: "Mac", PhoneID: "phone1", PhoneName: "iPhone",
+		SecretHash: "hash", APNsToken: "apns", CreatedAt: time.Now(),
+	})
+	_ = s.UpdateLiveActivityToken("phone1", "la-abc")
+
+	pair, err := s.LookupPairByPhone("phone1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pair.LiveActivityToken != "la-abc" {
+		t.Errorf("期望 LiveActivityToken=la-abc，实际 %s", pair.LiveActivityToken)
+	}
+}
+
 // TestTryMarkNonce 测试原子化 nonce 标记：首次返回 true，重复调用返回 false
 func TestTryMarkNonce(t *testing.T) {
 	s := newTestStore(t)
