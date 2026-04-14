@@ -541,12 +541,15 @@ func (rl *Relay) respondDeviceOffline(env protocol.Envelope, phoneID string, dev
 	var requestPayload map[string]interface{}
 	if err := json.Unmarshal(env.Payload, &requestPayload); err != nil {
 		log.Printf("[relay] invalid rpc request payload from phone=%s for offline device: %v", phoneID, err)
+		// 仍要让 phone 感知失败，而不是无限等待超时
+		rl.respondInvalidRPC(phoneID, env, "invalid rpc payload")
 		return
 	}
 
 	requestID, ok := requestPayload["id"]
 	if !ok {
 		log.Printf("[relay] rpc request missing id from phone=%s for offline device", phoneID)
+		rl.respondInvalidRPC(phoneID, env, "missing rpc id")
 		return
 	}
 
@@ -582,6 +585,50 @@ func (rl *Relay) respondDeviceOffline(env protocol.Envelope, phoneID string, dev
 	}
 	if err := pc.SafeWrite(websocket.TextMessage, data); err != nil {
 		log.Printf("[relay] write synthetic offline response error phone=%s: %v", phoneID, err)
+	}
+}
+
+// respondInvalidRPC 向 phone 回送"非法 RPC"错误响应。
+// 当 payload 无法解析、或缺失 id 字段时调用——若不回送，phone 客户端只能一直等到超时。
+// 若能从原始 payload 中解析出 id，则带上以便客户端对齐请求；否则置为 null。
+// 同 respondDeviceOffline 一样绕开环形缓冲：这类错误不应被 resume 重放。
+func (rl *Relay) respondInvalidRPC(phoneID string, requestEnv protocol.Envelope, message string) {
+	pc := rl.router.GetPhone(phoneID)
+	if pc == nil {
+		log.Printf("[relay] synthetic invalid-rpc response dropped: phone=%s not online (%s)", phoneID, message)
+		return
+	}
+
+	// 尽力而为解析 id：payload 完全无法解析时 id 保持为 nil
+	var requestID interface{}
+	var requestPayload map[string]interface{}
+	if err := json.Unmarshal(requestEnv.Payload, &requestPayload); err == nil {
+		if v, ok := requestPayload["id"]; ok {
+			requestID = v
+		}
+	}
+
+	payload := map[string]interface{}{
+		"id":      requestID,
+		"error":   "invalid_rpc",
+		"message": message,
+	}
+
+	seq := rl.seqGen.Add(1)
+	responseEnv := protocol.Envelope{
+		Ts:      time.Now().UnixMilli(),
+		From:    protocol.OriginMac,
+		Type:    protocol.TypeRPCResponse,
+		Seq:     seq,
+		Payload: mustMarshalRaw(payload),
+	}
+	data, err := json.Marshal(responseEnv)
+	if err != nil {
+		log.Printf("[relay] marshal synthetic invalid-rpc response error phone=%s: %v", phoneID, err)
+		return
+	}
+	if err := pc.SafeWrite(websocket.TextMessage, data); err != nil {
+		log.Printf("[relay] write synthetic invalid-rpc response error phone=%s: %v", phoneID, err)
 	}
 }
 

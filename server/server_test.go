@@ -441,6 +441,130 @@ func TestOfflineSyntheticResponseNotBuffered(t *testing.T) {
 	}
 }
 
+// TestPhoneRPCWithInvalidPayloadGetsError 验证 phone 发来的 rpc_request payload
+// 无法解析为 JSON 时，relay 会立即回送结构化错误，而不是让客户端等到超时。
+func TestPhoneRPCWithInvalidPayloadGetsError(t *testing.T) {
+	srv, err := NewServer(":memory:")
+	if err != nil {
+		t.Fatalf("创建 server 失败: %v", err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http")
+	deviceID := "mac-invalid-payload"
+	phoneID := "phone-invalid-payload"
+
+	pairSecret := testPairDeviceAndPhone(t, ts.URL, deviceID, phoneID)
+
+	phoneConn := testConnectWS(t, wsURL+"/ws/phone/"+phoneID, phoneID, pairSecret)
+	defer phoneConn.Close()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// 手工拼接一条 envelope，payload 字段故意是非法 JSON 字符串
+	// （json.RawMessage 必须合法，所以不能用 WriteJSON）
+	rawEnvelope := fmt.Sprintf(
+		`{"ts":%d,"from":"%s","type":"%s","payload":"not-json-at-all"}`,
+		time.Now().UnixMilli(), protocol.OriginPhone, protocol.TypeRPCRequest,
+	)
+	if err := phoneConn.WriteMessage(websocket.TextMessage, []byte(rawEnvelope)); err != nil {
+		t.Fatalf("Phone 发送消息失败: %v", err)
+	}
+
+	phoneConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, data, err := phoneConn.ReadMessage()
+	if err != nil {
+		t.Fatalf("Phone 读取响应失败（期望立即收到错误）: %v", err)
+	}
+	phoneConn.SetReadDeadline(time.Time{})
+
+	var receivedEnv protocol.Envelope
+	if err := json.Unmarshal(data, &receivedEnv); err != nil {
+		t.Fatalf("Phone 解析响应失败: %v", err)
+	}
+	if receivedEnv.Type != protocol.TypeRPCResponse {
+		t.Fatalf("期望 rpc_response，实际得到 %s", receivedEnv.Type)
+	}
+
+	var p map[string]interface{}
+	if err := json.Unmarshal(receivedEnv.Payload, &p); err != nil {
+		t.Fatalf("解析 payload 失败: %v", err)
+	}
+	if got := p["error"]; got != "invalid_rpc" {
+		t.Fatalf("期望 error=invalid_rpc，实际得到 %v", got)
+	}
+	if got, _ := p["message"].(string); got != "invalid rpc payload" {
+		t.Fatalf("期望 message=\"invalid rpc payload\"，实际得到 %q", got)
+	}
+	// payload 都无法解析，id 应为 null
+	if got, ok := p["id"]; !ok || got != nil {
+		t.Fatalf("期望 id=null，实际得到 ok=%v value=%v", ok, got)
+	}
+}
+
+// TestPhoneRPCMissingIDGetsError 验证 payload 虽然是合法 JSON 但缺 id 字段时，
+// relay 会回送 missing rpc id 错误。
+func TestPhoneRPCMissingIDGetsError(t *testing.T) {
+	srv, err := NewServer(":memory:")
+	if err != nil {
+		t.Fatalf("创建 server 失败: %v", err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http")
+	deviceID := "mac-missing-id"
+	phoneID := "phone-missing-id"
+
+	pairSecret := testPairDeviceAndPhone(t, ts.URL, deviceID, phoneID)
+
+	phoneConn := testConnectWS(t, wsURL+"/ws/phone/"+phoneID, phoneID, pairSecret)
+	defer phoneConn.Close()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// payload 合法 JSON 但没有 id 字段
+	phoneMsg := protocol.Envelope{
+		Ts:      time.Now().UnixMilli(),
+		From:    protocol.OriginPhone,
+		Type:    protocol.TypeRPCRequest,
+		Payload: json.RawMessage(`{"method":"surface.list","params":{}}`),
+	}
+	if err := phoneConn.WriteJSON(phoneMsg); err != nil {
+		t.Fatalf("Phone 发送消息失败: %v", err)
+	}
+
+	phoneConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, data, err := phoneConn.ReadMessage()
+	if err != nil {
+		t.Fatalf("Phone 读取响应失败（期望立即收到错误）: %v", err)
+	}
+	phoneConn.SetReadDeadline(time.Time{})
+
+	var receivedEnv protocol.Envelope
+	if err := json.Unmarshal(data, &receivedEnv); err != nil {
+		t.Fatalf("Phone 解析响应失败: %v", err)
+	}
+	if receivedEnv.Type != protocol.TypeRPCResponse {
+		t.Fatalf("期望 rpc_response，实际得到 %s", receivedEnv.Type)
+	}
+
+	var p map[string]interface{}
+	if err := json.Unmarshal(receivedEnv.Payload, &p); err != nil {
+		t.Fatalf("解析 payload 失败: %v", err)
+	}
+	if got := p["error"]; got != "invalid_rpc" {
+		t.Fatalf("期望 error=invalid_rpc，实际得到 %v", got)
+	}
+	if got, _ := p["message"].(string); got != "missing rpc id" {
+		t.Fatalf("期望 message=\"missing rpc id\"，实际得到 %q", got)
+	}
+	if got, ok := p["id"]; !ok || got != nil {
+		t.Fatalf("期望 id=null，实际得到 ok=%v value=%v", ok, got)
+	}
+}
+
 // TestEndToEnd_AuthFail 验证错误的 pair_secret 导致 auth_failed
 func TestEndToEnd_AuthFail(t *testing.T) {
 	srv, err := NewServer(":memory:")
