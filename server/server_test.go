@@ -337,6 +337,108 @@ func TestPhoneRPCToOfflineMacGetsImmediateError(t *testing.T) {
 	if got := receivedPayload["id"]; got != float64(7) {
 		t.Fatalf("期望 id=7，实际得到 %v", got)
 	}
+	// 断言合成响应的 message 不泄露内部 deviceID
+	msg, _ := receivedPayload["message"].(string)
+	if msg == "" {
+		t.Fatal("期望 message 字段非空")
+	}
+	if strings.Contains(msg, deviceID) {
+		t.Fatalf("message 不应包含内部 deviceID，实际: %q", msg)
+	}
+}
+
+// TestOfflineSyntheticResponseNotBuffered 验证当 mac 离线、合成 device_offline 响应发给 phone 后，
+// 该响应不会被写入环形缓冲区——否则 phone 离线重连 resume 时会重放这条过期错误，
+// 覆盖 mac 上线后返回的真实结果。
+func TestOfflineSyntheticResponseNotBuffered(t *testing.T) {
+	srv, err := NewServer(":memory:")
+	if err != nil {
+		t.Fatalf("创建 server 失败: %v", err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http")
+	deviceID := "mac-offline-buf"
+	phoneID := "phone-offline-buf"
+
+	pairSecret := testPairDeviceAndPhone(t, ts.URL, deviceID, phoneID)
+
+	// 第一次：phone 连接，mac 不在线，触发合成 offline 响应
+	phoneConn := testConnectWS(t, wsURL+"/ws/phone/"+phoneID, phoneID, pairSecret)
+
+	time.Sleep(50 * time.Millisecond)
+
+	reqPayload := `{"method":"surface.list","id":42,"params":{}}`
+	if err := phoneConn.WriteJSON(protocol.Envelope{
+		Ts:      time.Now().UnixMilli(),
+		From:    protocol.OriginPhone,
+		Type:    protocol.TypeRPCRequest,
+		Payload: json.RawMessage(reqPayload),
+	}); err != nil {
+		t.Fatalf("Phone 发送消息失败: %v", err)
+	}
+
+	// 读取合成 offline 响应，记录其 seq
+	phoneConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, data, err := phoneConn.ReadMessage()
+	if err != nil {
+		t.Fatalf("Phone 读取合成响应失败: %v", err)
+	}
+	phoneConn.SetReadDeadline(time.Time{})
+
+	var offlineEnv protocol.Envelope
+	if err := json.Unmarshal(data, &offlineEnv); err != nil {
+		t.Fatalf("解析合成响应失败: %v", err)
+	}
+	if offlineEnv.Type != protocol.TypeRPCResponse {
+		t.Fatalf("期望 rpc_response，实际 %s", offlineEnv.Type)
+	}
+
+	// phone 断开，稍后重连并发 resume(last_seq=0)
+	phoneConn.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	phoneConn2 := testConnectWS(t, wsURL+"/ws/phone/"+phoneID, phoneID, pairSecret)
+	defer phoneConn2.Close()
+
+	time.Sleep(50 * time.Millisecond)
+
+	resumePayloadJSON, _ := json.Marshal(map[string]interface{}{"last_seq": 0})
+	if err := phoneConn2.WriteJSON(protocol.Envelope{
+		Ts:      time.Now().UnixMilli(),
+		From:    protocol.OriginPhone,
+		Type:    protocol.TypeResume,
+		Payload: resumePayloadJSON,
+	}); err != nil {
+		t.Fatalf("Phone 发送 resume 失败: %v", err)
+	}
+
+	// 在 500ms 内收集所有重放消息；期望 0 条——buffer 中不应有合成 offline 响应
+	phoneConn2.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	var replayed []protocol.Envelope
+	for {
+		_, d, rerr := phoneConn2.ReadMessage()
+		if rerr != nil {
+			break
+		}
+		var e protocol.Envelope
+		if uerr := json.Unmarshal(d, &e); uerr != nil {
+			continue
+		}
+		replayed = append(replayed, e)
+	}
+	phoneConn2.SetReadDeadline(time.Time{})
+
+	for _, e := range replayed {
+		if e.Type == protocol.TypeRPCResponse {
+			var p map[string]interface{}
+			_ = json.Unmarshal(e.Payload, &p)
+			if p["error"] == "device_offline" {
+				t.Fatalf("合成的 device_offline 响应不应被重放（buffered），got seq=%d payload=%v", e.Seq, p)
+			}
+		}
+	}
 }
 
 // TestEndToEnd_AuthFail 验证错误的 pair_secret 导致 auth_failed

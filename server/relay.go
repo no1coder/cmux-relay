@@ -3,7 +3,6 @@ package server
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"strings"
 	"sync/atomic"
@@ -533,35 +532,57 @@ func (rl *Relay) forwardToDevice(env protocol.Envelope, deviceID string, phoneID
 	}
 }
 
+// respondDeviceOffline 向 phone 直接回送"设备离线"的合成 rpc_response。
+// 注意：该合成响应不写入环形缓冲区——否则 phone 离线重连触发 resume 重放时，
+// 会用这条过时的 offline 错误覆盖 mac 已上线后返回的真实结果。
+// 因此这里绕开 forwardToPhone（那条路径包含 buf.Push），直接向当前在线的 phone 连接写入。
+// 若 phone 此刻也不在线，则静默丢弃：phone 重连后会自然超时/重发请求。
 func (rl *Relay) respondDeviceOffline(env protocol.Envelope, phoneID string, deviceID string) {
 	var requestPayload map[string]interface{}
 	if err := json.Unmarshal(env.Payload, &requestPayload); err != nil {
-		log.Printf("[relay] invalid rpc request payload from phone=%s for offline device=%s: %v", phoneID, deviceID, err)
+		log.Printf("[relay] invalid rpc request payload from phone=%s for offline device: %v", phoneID, err)
 		return
 	}
 
 	requestID, ok := requestPayload["id"]
 	if !ok {
-		log.Printf("[relay] rpc request missing id from phone=%s for offline device=%s", phoneID, deviceID)
+		log.Printf("[relay] rpc request missing id from phone=%s for offline device", phoneID)
 		return
 	}
 
 	method, _ := requestPayload["method"].(string)
+	// 不把内部 deviceID 写入响应 message，避免向 phone 端泄露
 	payload := map[string]interface{}{
 		"id":      requestID,
 		"error":   "device_offline",
-		"message": fmt.Sprintf("device %s is offline", deviceID),
+		"message": "mac device is offline",
 		"method":  method,
 	}
 
+	// 仍分配 seq 以保持响应序号语义（phone 侧可用它判断新鲜度）
+	seq := rl.seqGen.Add(1)
 	responseEnv := protocol.Envelope{
 		Ts:      time.Now().UnixMilli(),
 		From:    protocol.OriginMac,
 		Type:    protocol.TypeRPCResponse,
+		Seq:     seq,
 		Payload: mustMarshalRaw(payload),
 	}
 
-	rl.forwardToPhone(responseEnv, deviceID, phoneID)
+	pc := rl.router.GetPhone(phoneID)
+	if pc == nil {
+		// phone 离线：不 push 到 buffer，避免日后重放这条过期错误
+		log.Printf("[relay] synthetic offline response dropped: phone=%s not online for offline device=%s", phoneID, deviceID)
+		return
+	}
+	data, err := json.Marshal(responseEnv)
+	if err != nil {
+		log.Printf("[relay] marshal synthetic offline response error phone=%s: %v", phoneID, err)
+		return
+	}
+	if err := pc.SafeWrite(websocket.TextMessage, data); err != nil {
+		log.Printf("[relay] write synthetic offline response error phone=%s: %v", phoneID, err)
+	}
 }
 
 func mustMarshalRaw(value interface{}) json.RawMessage {
