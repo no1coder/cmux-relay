@@ -274,6 +274,71 @@ func TestEndToEnd_PairAndRelay(t *testing.T) {
 	}
 }
 
+// TestPhoneRPCToOfflineMacGetsImmediateError 验证当 Phone 发起 rpc_request 但 Mac 不在线时，
+// relay 会立刻返回结构化 rpc_response，而不是让客户端一直等到超时。
+func TestPhoneRPCToOfflineMacGetsImmediateError(t *testing.T) {
+	srv, err := NewServer(":memory:")
+	if err != nil {
+		t.Fatalf("创建 server 失败: %v", err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http")
+	deviceID := "mac-offline-test"
+	phoneID := "phone-offline-test"
+
+	pairSecret := testPairDeviceAndPhone(t, ts.URL, deviceID, phoneID)
+
+	phoneConn := testConnectWS(t, wsURL+"/ws/phone/"+phoneID, phoneID, pairSecret)
+	defer phoneConn.Close()
+
+	time.Sleep(50 * time.Millisecond)
+
+	payload := `{"method":"surface.list","id":7,"params":{}}`
+	phoneMsg := protocol.Envelope{
+		Ts:      time.Now().UnixMilli(),
+		From:    protocol.OriginPhone,
+		Type:    protocol.TypeRPCRequest,
+		Payload: json.RawMessage(payload),
+	}
+	if err := phoneConn.WriteJSON(phoneMsg); err != nil {
+		t.Fatalf("Phone 发送消息失败: %v", err)
+	}
+
+	phoneConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, data, err := phoneConn.ReadMessage()
+	if err != nil {
+		t.Fatalf("Phone 读取响应失败: %v", err)
+	}
+	phoneConn.SetReadDeadline(time.Time{})
+
+	var receivedEnv protocol.Envelope
+	if err := json.Unmarshal(data, &receivedEnv); err != nil {
+		t.Fatalf("Phone 解析响应失败: %v", err)
+	}
+	if receivedEnv.Type != protocol.TypeRPCResponse {
+		t.Fatalf("期望 rpc_response，实际得到 %s", receivedEnv.Type)
+	}
+	if receivedEnv.Seq == 0 {
+		t.Fatal("期望 relay 为离线错误响应分配 seq > 0")
+	}
+
+	var receivedPayload map[string]interface{}
+	if err := json.Unmarshal(receivedEnv.Payload, &receivedPayload); err != nil {
+		t.Fatalf("解析 payload 失败: %v", err)
+	}
+	if got := receivedPayload["error"]; got != "device_offline" {
+		t.Fatalf("期望 error=device_offline，实际得到 %v", got)
+	}
+	if got := receivedPayload["method"]; got != "surface.list" {
+		t.Fatalf("期望 method=surface.list，实际得到 %v", got)
+	}
+	if got := receivedPayload["id"]; got != float64(7) {
+		t.Fatalf("期望 id=7，实际得到 %v", got)
+	}
+}
+
 // TestEndToEnd_AuthFail 验证错误的 pair_secret 导致 auth_failed
 func TestEndToEnd_AuthFail(t *testing.T) {
 	srv, err := NewServer(":memory:")

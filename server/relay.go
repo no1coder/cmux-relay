@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"strings"
 	"sync/atomic"
@@ -192,7 +193,7 @@ func (rl *Relay) HandlePhoneWS(conn *websocket.Conn, phoneID string) {
 		}
 
 		// 其他消息转发给 Mac
-		rl.forwardToDevice(env, pair.DeviceID)
+		rl.forwardToDevice(env, pair.DeviceID, phoneID)
 	}
 }
 
@@ -511,10 +512,15 @@ func isTerminalAPNsError(err error) bool {
 		strings.Contains(s, "DeviceTokenNotForTopic")
 }
 
-// forwardToDevice 将消息发送给在线 Mac 设备
-func (rl *Relay) forwardToDevice(env protocol.Envelope, deviceID string) {
+// forwardToDevice 将消息发送给在线 Mac 设备。
+// 当 Phone 发起 RPC 请求但目标 Mac 不在线时，立即回送结构化 rpc_response，
+// 避免客户端只能靠超时推断失败。
+func (rl *Relay) forwardToDevice(env protocol.Envelope, deviceID string, phoneID string) {
 	dc := rl.router.GetDevice(deviceID)
 	if dc == nil {
+		if env.From == protocol.OriginPhone && env.Type == protocol.TypeRPCRequest && phoneID != "" {
+			rl.respondDeviceOffline(env, phoneID, deviceID)
+		}
 		return
 	}
 	data, err := json.Marshal(env)
@@ -525,6 +531,46 @@ func (rl *Relay) forwardToDevice(env protocol.Envelope, deviceID string) {
 	if err := dc.SafeWrite(websocket.TextMessage, data); err != nil {
 		log.Printf("[relay] write error to device=%s: %v", deviceID, err)
 	}
+}
+
+func (rl *Relay) respondDeviceOffline(env protocol.Envelope, phoneID string, deviceID string) {
+	var requestPayload map[string]interface{}
+	if err := json.Unmarshal(env.Payload, &requestPayload); err != nil {
+		log.Printf("[relay] invalid rpc request payload from phone=%s for offline device=%s: %v", phoneID, deviceID, err)
+		return
+	}
+
+	requestID, ok := requestPayload["id"]
+	if !ok {
+		log.Printf("[relay] rpc request missing id from phone=%s for offline device=%s", phoneID, deviceID)
+		return
+	}
+
+	method, _ := requestPayload["method"].(string)
+	payload := map[string]interface{}{
+		"id":      requestID,
+		"error":   "device_offline",
+		"message": fmt.Sprintf("device %s is offline", deviceID),
+		"method":  method,
+	}
+
+	responseEnv := protocol.Envelope{
+		Ts:      time.Now().UnixMilli(),
+		From:    protocol.OriginMac,
+		Type:    protocol.TypeRPCResponse,
+		Payload: mustMarshalRaw(payload),
+	}
+
+	rl.forwardToPhone(responseEnv, deviceID, phoneID)
+}
+
+func mustMarshalRaw(value interface{}) json.RawMessage {
+	data, err := json.Marshal(value)
+	if err != nil {
+		log.Printf("[relay] marshal synthetic payload error: %v", err)
+		return json.RawMessage(`{"error":"internal_error","message":"failed to marshal synthetic payload"}`)
+	}
+	return data
 }
 
 // marshalSimple 序列化一个简单的 {"key":"value"} 消息
