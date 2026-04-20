@@ -539,21 +539,31 @@ func (rl *Relay) forwardToDevice(env protocol.Envelope, deviceID string, phoneID
 // 若 phone 此刻也不在线，则静默丢弃：phone 重连后会自然超时/重发请求。
 func (rl *Relay) respondDeviceOffline(env protocol.Envelope, phoneID string, deviceID string) {
 	var requestPayload map[string]interface{}
-	if err := json.Unmarshal(env.Payload, &requestPayload); err != nil {
-		log.Printf("[relay] invalid rpc request payload from phone=%s for offline device: %v", phoneID, err)
-		// 仍要让 phone 感知失败，而不是无限等待超时
-		rl.respondInvalidRPC(phoneID, env, "invalid rpc payload")
+	payloadErr := json.Unmarshal(env.Payload, &requestPayload)
+
+	// 优先从 envelope 顶层取 id（支持 E2E 加密 payload），其次 fallback 到 payload.id
+	var requestID interface{}
+	if env.ID != nil {
+		requestID = env.ID
+	} else if payloadErr == nil {
+		requestID = requestPayload["id"]
+	}
+	if requestID == nil {
+		// 无论哪条 fail 路径，都希望客户端能感知失败、无需等到超时
+		if payloadErr != nil {
+			log.Printf("[relay] invalid rpc request payload from phone=%s for offline device: %v", phoneID, payloadErr)
+			rl.respondInvalidRPC(phoneID, env, "invalid rpc payload")
+		} else {
+			log.Printf("[relay] rpc request missing id from phone=%s for offline device", phoneID)
+			rl.respondInvalidRPC(phoneID, env, "missing rpc id")
+		}
 		return
 	}
 
-	requestID, ok := requestPayload["id"]
-	if !ok {
-		log.Printf("[relay] rpc request missing id from phone=%s for offline device", phoneID)
-		rl.respondInvalidRPC(phoneID, env, "missing rpc id")
-		return
+	var method string
+	if requestPayload != nil {
+		method, _ = requestPayload["method"].(string)
 	}
-
-	method, _ := requestPayload["method"].(string)
 	// 不把内部 deviceID 写入响应 message，避免向 phone 端泄露
 	payload := map[string]interface{}{
 		"id":      requestID,
@@ -599,12 +609,16 @@ func (rl *Relay) respondInvalidRPC(phoneID string, requestEnv protocol.Envelope,
 		return
 	}
 
-	// 尽力而为解析 id：payload 完全无法解析时 id 保持为 nil
+	// 尽力而为解析 id：优先 envelope 顶层（E2E 加密时唯一可读源），其次 payload.id
 	var requestID interface{}
-	var requestPayload map[string]interface{}
-	if err := json.Unmarshal(requestEnv.Payload, &requestPayload); err == nil {
-		if v, ok := requestPayload["id"]; ok {
-			requestID = v
+	if requestEnv.ID != nil {
+		requestID = requestEnv.ID
+	} else {
+		var requestPayload map[string]interface{}
+		if err := json.Unmarshal(requestEnv.Payload, &requestPayload); err == nil {
+			if v, ok := requestPayload["id"]; ok {
+				requestID = v
+			}
 		}
 	}
 

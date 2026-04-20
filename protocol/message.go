@@ -54,6 +54,10 @@ type Envelope struct {
 	From Origin `json:"from"`
 	// Type 表示消息的业务类型
 	Type MessageType `json:"type"`
+	// ID 是 RPC 请求 id 的明文镜像，供 E2E 加密场景下的错误合成使用。
+	// 手机端会把 id 同时放进加密 payload 和 envelope 顶层；relay 在 Mac
+	// 离线时读不到加密 payload 里的 id，必须从这里取才能构造带 id 的错误响应。
+	ID interface{} `json:"id,omitempty"`
 	// PushHintData 是明文推送提示，仅在 E2E 加密消息中使用
 	PushHintData *PushHint `json:"push_hint,omitempty"`
 	// Payload 是消息的业务数据，使用原始 JSON 延迟解析
